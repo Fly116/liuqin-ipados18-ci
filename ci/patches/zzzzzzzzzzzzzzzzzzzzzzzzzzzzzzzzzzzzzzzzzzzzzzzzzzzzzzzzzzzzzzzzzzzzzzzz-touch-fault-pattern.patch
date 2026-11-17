@@ -1,0 +1,60 @@
+--- a/bsd/dev/pong_touch.c
++++ b/bsd/dev/pong_touch.c
+@@ -4650,13 +4650,7 @@
+ 	return false;
+ }
+ 
+-/*
+- * nvt_wdt_fw_recovery() counts *interrupts* that carry 0xFD/0xFE in the record
+- * area, not reads: after a normal lift the buffer also sits at 0xFD, so a plain
+- * read counter fires on every gesture.  Three interrupts without a frame, on the
+- * other hand, means the part is in its CRC-fail reboot loop (its state register
+- * even reads 0xFC in that loop).
+- */
++/* 与 Ubuntu 驱动一致，只把连续的 FD/FE 故障数据计入固件恢复。 */
+ static void
+ tch_frame_streak(const uint8_t *frame, bool int_edge)
+ {
+@@ -4671,34 +4665,15 @@
+ 	if (!int_edge) {
+ 		return;
+ 	}
+-	if (++tch_hang_hits >= 3) {
++	for (unsigned i = 0; i < 6; i++) {
++		if (frame[i] != 0xfd && frame[i] != 0xfe) {
++			tch_hang_hits = 0;
++			return;
++		}
++	}
++	if (++tch_hang_hits > 10) {
+ 		tch_hang_hits = 0;
+-		/*
+-		 * touch175: before paying for a whole re-download, give the firmware
+-		 * the one thing the vendor gives it after boot - the host-alive write
+-		 * to event+0x51 - and look at the report area again.  touch172 ran
+-		 * 216 s with the panel reporting and touch171/173/174 lost it 10-18 s
+-		 * after boot with the same 0x51 write done once, so this asks whether
+-		 * the byte is what the part is waiting for rather than a boot step.
+-		 */
+-		(void)tch_nvt_write8(NVT_FW_STATUS_BYTE, 0x00);
+-		/* A lift, or a read that lands between two reports, also shows
+-		 * 0xfd.  Give the part 200 ms (20 frames at its report rate) to
+-		 * send a valid frame before paying for a re-download. */
+-		for (unsigned wait = 0; wait < 20; wait++) {
+-			uint8_t again[NVT_POINT_LEN] = { 0 };
+-
+-			delay(10 * 1000);
+-			if (tch_nvt_read(NVT_EVENT_BUF_ADDR, again, sizeof(again)) == 0 &&
+-			    tch_frame_valid(again)) {
+-				printf("LIUQIN TOUCH: a valid frame arrived after the "
+-				    "0x51 ack, keeping the firmware running\n");
+-				return;
+-			}
+-		}
+-		printf("LIUQIN TOUCH: three interrupts with 0xFD in the report area: the "
+-		    "firmware is stuck (vendor's CRC-fail loop pattern), %u valid "
+-		    "frames so far\n", tch_valid_frames);
++		printf("LIUQIN TOUCH: repeated FD/FE reports; requesting firmware recovery\n");
+ 		tch_fw_dead = 1;
+ 	}
+ }

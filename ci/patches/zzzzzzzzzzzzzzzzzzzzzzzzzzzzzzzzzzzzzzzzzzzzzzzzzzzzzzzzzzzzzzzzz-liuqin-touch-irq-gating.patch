@@ -1,0 +1,165 @@
+--- a/bsd/dev/pong_touch.c
++++ b/bsd/dev/pong_touch.c
+@@ -4286,8 +4286,6 @@
+ 	return 0;
+ }
+ 
+-static void tch_dump_event_page(unsigned n);
+-
+ /* Returns true when the controller answered with data we can trust (a Novatek
+  * trim id or a self-consistent FWINFO), so garbage never reaches the HID
+  * layer as "touch". */
+@@ -4652,67 +4650,6 @@
+ 	return false;
+ }
+ 
+-/* Diagnostics for the "panel asserts INT but no frame decodes" state: dump the
+- * report page at the moment the controller says it has data, twice, plus the
+- * registers that prove the bus still answers. */
+-static unsigned tch_int_dumps;
+-
+-static void
+-tch_dump_event_page(unsigned n)
+-{
+-	uint8_t b[96];
+-	uint8_t st = 0;
+-	uint8_t fw[4] = { 0 };
+-	uint32_t saved_dummy = tch.dummy;
+-	unsigned i;
+-
+-	printf("LIUQIN TOUCH: int-dump %u at pace %u us\n", n, tch.bb_pace_us);
+-	if (tch_nvt_read(NVT_EVENT_BUF_ADDR, b, sizeof(b)) == 0) {
+-		printf("LIUQIN TOUCH: dump%u 125800:", n);
+-		for (i = 0; i < 24; i++) {
+-			printf(" %02x", b[i]);
+-		}
+-		printf("\nLIUQIN TOUCH: dump%u 125818:", n);
+-		for (i = 24; i < 48; i++) {
+-			printf(" %02x", b[i]);
+-		}
+-		printf("\n");
+-	} else {
+-		printf("LIUQIN TOUCH: dump%u 125800 read failed\n", n);
+-	}
+-	/* The two addresses the older NT36xxx maps use, in case this firmware
+-	 * keeps its report somewhere else than the vendor map says. */
+-	if (tch_nvt_read(0x2fe00, b, 32) == 0) {
+-		printf("LIUQIN TOUCH: dump%u 2fe00:", n);
+-		for (i = 0; i < 16; i++) {
+-			printf(" %02x", b[i]);
+-		}
+-		printf("\n");
+-	}
+-	if (tch_nvt_read(0x11a00, b, 32) == 0) {
+-		printf("LIUQIN TOUCH: dump%u 11a00:", n);
+-		for (i = 0; i < 16; i++) {
+-			printf(" %02x", b[i]);
+-		}
+-		printf("\n");
+-	}
+-	/* Same address without the dummy byte: a shift here means the framing
+-	 * (not the data) is what we get wrong. */
+-	tch.dummy = 0;
+-	if (tch_nvt_read(NVT_EVENT_BUF_ADDR, b, 24) == 0) {
+-		printf("LIUQIN TOUCH: dump%u nodummy:", n);
+-		for (i = 0; i < 16; i++) {
+-			printf(" %02x", b[i]);
+-		}
+-		printf("\n");
+-	}
+-	tch.dummy = saved_dummy;
+-	(void)tch_nvt_read(NVT_EVENT_RESET_STATE, &st, 1);
+-	(void)tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
+-	printf("LIUQIN TOUCH: dump%u: state 0x%02x fwinfo %02x %02x %02x %02x\n",
+-	    n, st, fw[0], fw[1], fw[2], fw[3]);
+-}
+-
+ /*
+  * nvt_wdt_fw_recovery() counts *interrupts* that carry 0xFD/0xFE in the record
+  * area, not reads: after a normal lift the buffer also sits at 0xFD, so a plain
+@@ -4794,7 +4731,6 @@
+ 	unsigned errors = 0;
+ 	unsigned edge_logs = 0;
+ 	unsigned evt_logs = 0;
+-	unsigned polls = 0;
+ 	bool prev_high = false;
+ 	int force_poll = 0;
+ 	bool saw_gpio = false;
+@@ -4850,15 +4786,18 @@
+ 
+ 		const uint32_t gpio = tch_rd(tch.tlmm, TLMM_CTL(21) + TLMM_IN_OUT);
+ 		bool go = force_poll || (gpio & TLMM_IN_BIT) != 0;
++		/* 已按下的槽位继续沿原流程处理抬手，空闲时只等控制器中断。 */
++		for (unsigned slot = 0; slot < NVT_MAX_FINGERS; slot++) {
++			if (down[slot]) {
++				go = true;
++				break;
++			}
++		}
+ 
+ 		const bool int_high = (gpio & TLMM_IN_BIT) != 0;
+ 
+ 		const bool int_edge = int_high && !prev_high;
+ 
+-		if (int_edge && tch_int_dumps < 8) {
+-			tch_int_dumps++;
+-			tch_dump_event_page(tch_int_dumps);
+-		}
+ 		if (int_high != prev_high && edge_logs < 40) {
+ 			edge_logs++;
+ 			printf("LIUQIN TOUCH: gpio21 %s (level %u)\n",
+@@ -4878,34 +4817,11 @@
+ 			    TLMM_MUX(tch_rd(tch.tlmm, TLMM_CTL(21))),
+ 			    TLMM_PULL(tch_rd(tch.tlmm, TLMM_CTL(21))));
+ 		}
+-		/*
+-		 * With no interrupt the buffer still has to be watched: read it on
+-		 * every tick (10 ms) for the first minute of the thread's life, then
+-		 * back off to once a second so the path stays alive without cost.
+-		 */
+-		polls++;
+-		/*
+-		 * No idle watchdog here any more.  It poked the INT line every
+-		 * two seconds without a finger and pulsed the reset line every
+-		 * third poke, which put a running panel back into its bootloader
+-		 * about every six seconds; the next download then took 70 s and
+-		 * mostly failed, so touch never survived.  Silence with nobody
+-		 * touching the glass is not a fault: the recovery thread decides
+-		 * that from the controller's own state register, and only when
+-		 * the part really stopped answering.
+-		 */
+-		/*
+-		 * The interrupt line of this panel never asserts, so the event buffer
+-		 * has to be polled for the lifetime of the thread.  This used to skip
+-		 * the read entirely once "polls" passed 6000, which is exactly the
+-		 * "touch works for a minute and then stops" this port showed: after
+-		 * the first minute nothing was read at all any more.
+-		 */
+-		const bool health = !go;
+-		/* touch179: does the report area still change after the panel stops
+-		 * producing frames?  A frozen buffer means the firmware stopped
+-		 * writing; a buffer that keeps changing but never validates means we
+-		 * are racing its writes.  Counted here, printed in the heartbeat. */
++		/* 在获取 SPI 通信锁之前等待，避免空闲读取和诊断读取干扰固件。 */
++		if (!go) {
++			(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintouch", ticks);
++			continue;
++		}
+ 
+ 		/*
+ 		 * One read per tick, not two: reading the 109-byte block and then
+@@ -4986,14 +4902,6 @@
+ 					}
+ 				}
+ 
+-				if (health && !force_poll && fingers > 0) {
+-					/* A touch arrived without the interrupt line
+-					 * asserting: wrong pin read, wrong polarity or
+-					 * no INT at all.  Poll from now on. */
+-					force_poll = 1;
+-					printf("LIUQIN TOUCH: gpio21 did not assert for a touch, "
+-					    "polling the event buffer\n");
+-				}
+ 			}
+ 		}
+ 		(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintouch", ticks);

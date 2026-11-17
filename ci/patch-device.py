@@ -4,8 +4,13 @@ import argparse
 import difflib
 from pathlib import Path
 import shutil
+import sys
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import patch_liuqin_wave1
 
 
 def read_lf(path):
@@ -90,7 +95,8 @@ def main():
     replace(ufs, '    if (gPongLogEnabled || !layout.imageBytes) return;',
             '    if (gPongLogEnabled || !layout.imageBytes) return;\n'
             '    PE_parse_boot_argn("pong_log_flushes", &gPongLogMaxFlushes, sizeof(gPongLogMaxFlushes));')
-    print('已应用 liuqin 会话复位、日志时限、ramoops 地址与引导记录保留适配')
+    patch_liuqin_wave1.apply(device)
+    print('已应用 liuqin 会话复位、日志时限、ramoops 地址、引导记录保留及第一波性能驱动适配')
 
 
 if __name__ == '__main__':

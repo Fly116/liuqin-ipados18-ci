@@ -5,11 +5,12 @@ import shutil
 
 out = Path('products')
 out.mkdir(exist_ok=True)
-roots = [Path('UniXNU/out'), Path('tree/build'), Path('device/mac-build')]
+roots = [Path('UniXNU/out'), Path('tree/build'), Path('device/mac-build'), Path('products-ui')]
 files = set()
 names = {'kernel.macho', 'kernel.json', 'kernel.failed.json', 'mach.development.pong',
          'hardware.dtb', 'kernelcache.decompressed', 'PONG_BUILD_RESULT.json', '.config',
-         'bindings.json', 'PongIOAcceleratorBindings.S', 'build-report.json'}
+         'bindings.json', 'PongIOAcceleratorBindings.S', 'build-report.json',
+         'libpong-ui.dylib', 'libpong-ui18.dylib', 'ui-compile-command.json'}
 for root in roots:
     if not root.exists():
         continue

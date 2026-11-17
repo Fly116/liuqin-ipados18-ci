@@ -27,6 +27,9 @@ def main():
         data = path.read_bytes()
         assert b'\r' not in data, path
         ast.parse(data, filename=str(path))
+    for folder in ('patches', 'overrides'):
+        for path in (here / folder).iterdir():
+            assert b'\r' not in path.read_bytes(), path
     args.scratch.mkdir(parents=True, exist_ok=False)
     device = args.scratch / 'device'
     subprocess.run([sys.executable, '-I', str(here / 'prepare-device.py'),
@@ -35,6 +38,17 @@ def main():
                  'drivers/PongAdreno/submit/NativeAdrenoABI.h',
                  'UniXNU-sheng/package'):
         assert (device / name).exists(), name
+    subprocess.run([sys.executable, '-I', str(here / 'patch-device.py'), str(device)], check=True)
+    assert 'CONFIG_XNU_PONG_POWER=y' in (device / 'configs/liuqin_ipados18_defconfig').read_text(encoding='utf-8')
+    assert 'CONFIG_XNU_PONG_BACKLIGHT=y' in (device / 'configs/liuqin_ipados18_defconfig').read_text(encoding='utf-8')
+    assert '{0,4,2016000}' in (device / 'drivers/ArmCpu/PongCpuPolicy.h').read_text(encoding='utf-8')
+    assert f'{818000000:#x}u' in (device / 'drivers/PongAdreno/PongAdrenoPowerProfile.h').read_text(encoding='utf-8')
+    assert '0x9fd00000' in (device / 'drivers/PongPower/PongAdsp.cpp').read_text(encoding='utf-8')
+    assert 'PONG_IOSURFACE_PADDING' in (device / 'userland/ui_compat18.c').read_text(encoding='utf-8')
+    assert (device / 'drivers/PongPower/LiuqinBacklight.cpp').is_file()
+    repeat_device = subprocess.run([sys.executable, '-I', str(here / 'patch-device.py'),
+                                    str(device)], capture_output=True)
+    assert repeat_device.returncode != 0, '设备补丁重复应用必须失败'
     original = args.mesa / 'src/freedreno/vulkan/tu_knl_darwin.cc'
     target = args.scratch / 'mesa/src/freedreno/vulkan/tu_knl_darwin.cc'
     target.parent.mkdir(parents=True)
