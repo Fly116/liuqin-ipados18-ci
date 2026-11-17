@@ -1,0 +1,127 @@
+name: userdata
+
+on:
+  workflow_dispatch:
+    inputs:
+      metal_run_id:
+        description: 'Successful metal workflow run ID; empty builds software-rendered diagnostics only'
+        type: string
+        default: ''
+      upload_image:
+        description: 'Build and upload the encrypted SHNGROOT sparse image'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  QPRS_REF: 38ca105d915283d6c5342063965ab13572288e8a
+  IPSW_URL: https://updates.cdn-apple.com/2026WinterFCS/fullrestores/140-97955/A3F72236-89AD-47C5-8394-5E824079C175/iPad_10.2_18.7.10_22H374_Restore.ipsw
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+
+jobs:
+  userdata:
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: QPRS-6/iPadOS18-liuqin
+          ref: ${{ env.QPRS_REF }}
+          path: upstream
+          persist-credentials: false
+      - name: Prepare tools and device source
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test "${#ARTIFACT_PASSWORD}" -ge 12
+          sudo -n true
+          for t in hdiutil diskutil aea gh python3; do command -v "$t"; done
+          brew install sevenzip
+          python3 ci/prepare-device.py upstream device
+          python3 -m venv userland-venv
+          userland-venv/bin/python -m pip install --disable-pip-version-check pyhpke
+          df -h /
+      - name: Prepare 22H374 userland
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          userland-venv/bin/python device/scripts/prepare-pong-userland-from-ipsw.py \
+            --ipsw-url "$IPSW_URL" --work-dir "$RUNNER_TEMP/ipsw-work" \
+            --out "$RUNNER_TEMP/userland" --developer "$(xcode-select -p)" \
+            --json-out userland-report.json --volume-layout-out volume-layout.json --jobs 4
+          python3 ci/check-volumes.py volume-layout.json userland-report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: volume-layout
+          path: volume-layout.json
+          if-no-files-found: error
+          retention-days: 3
+      - name: Install matching Metal runtime
+        if: inputs.metal_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          METAL_RUN_ID: ${{ inputs.metal_run_id }}
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          case "$METAL_RUN_ID" in *[!0-9]*|'') exit 1 ;; esac
+          gh run watch "$METAL_RUN_ID" -R "$GITHUB_REPOSITORY" --interval 60 --exit-status
+          gh run download "$METAL_RUN_ID" -R "$GITHUB_REPOSITORY" -n metal-encrypted -D metal-download
+          7zz x -y -bso0 "-p${ARTIFACT_PASSWORD}" -ometal-products metal-download/metal.7z
+          test -f metal-products/runtime/build-report.json
+          sudo "$PWD/userland-venv/bin/python" device/userland/build-ipados18.py refresh_metal \
+            --out "$RUNNER_TEMP/userland" --runtime "$PWD/metal-products/runtime"
+      - name: Build hashed SHNGROOT layout
+        run: |
+          set -euo pipefail
+          python3 device/scripts/prepare-ipados18-ufs-layout.py \
+            --userland "$RUNNER_TEMP/userland" \
+            --systemos "$RUNNER_TEMP/userland/pong-ipados18-systemos.cdr" \
+            --volume-layout "$PWD/volume-layout.json" --output-dir "$PWD/ufs"
+      - name: Build sparse image
+        if: inputs.upload_image
+        run: |
+          set -euo pipefail
+          mkdir image-products
+          python3 device/scripts/build-pong-userdata-simg.py \
+            --layout "$PWD/ufs/ufs-layout.json" --header "$PWD/ufs/shngroot-ipados18.bin" \
+            --output "$PWD/image-products/userdata.simg" --json-out "$PWD/sparse-report.json"
+          cp volume-layout.json sparse-report.json ufs/ufs-layout.json ufs/shngroot-ipados18.bin image-products/
+          python3 ci/encrypt-products.py image-products upload-image/userdata.7z --split
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        if: inputs.upload_image
+        with:
+          name: userdata-encrypted
+          path: upload-image/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+      - name: Collect metadata and diagnostics
+        if: always()
+        run: |
+          python3 ci/collect-userdata.py
+      - name: Encrypt diagnostics
+        if: always()
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+        run: |
+          python3 ci/encrypt-products.py products upload-meta/userdata-meta.7z
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: userdata-meta-encrypted
+          path: upload-meta/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
