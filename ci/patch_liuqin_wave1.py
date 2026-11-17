@@ -16,6 +16,10 @@ TOUCH_PATCHES = (
     'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-touch-raw-latch.patch',
 )
 
+EXTRA_XNU_PATCHES = (
+    'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-liuqin-icache-phystokv.patch',
+)
+
 GPU_OPPS = (
     (818000000, 384),
     (818000000, 384),
@@ -226,7 +230,7 @@ def patch_touch_and_hall(device: Path) -> None:
         '+\n'
         '+\t\t(void)tch_nvt_read(NVT_TX_AUTO_COPY_EN, info, sizeof(info));',
     )
-    for name in TOUCH_PATCHES:
+    for name in (*TOUCH_PATCHES, *EXTRA_XNU_PATCHES):
         src = HERE / 'patches' / name
         dst = patches_dir / name
         if dst.exists():
@@ -431,7 +435,10 @@ def patch_power_backlight_adsp(device: Path) -> None:
     replace_exact(
         adsp,
         '#include <pexpert/pexpert.h>',
-        '#include <pexpert/pexpert.h>\n#include <pexpert/device_tree.h>',
+        '#include <pexpert/pexpert.h>\n'
+        '#include <pexpert/device_tree.h>\n'
+        'extern "C" bool pong_ufs_ready(void) __attribute__((weak_import));\n'
+        'extern "C" void pong_log_panic_flush(void) __attribute__((weak_import));',
     )
     replace_exact(
         adsp,
@@ -529,6 +536,36 @@ def patch_power_backlight_adsp(device: Path) -> None:
         '            if (file && sheng_fw_read(image.file, s.file_offset + done, bounce, file)) {rc = -5; break;}',
         '            if (file && readImage(image, s.file_offset + done, bounce, file)) {rc = -5; break;}',
     )
+    replace_exact(
+        adsp,
+        'void adspThread(void *, wait_result_t) {\n'
+        '    thread_set_thread_name(current_thread(), "pong_adsp");\n'
+        '    unsigned mode = 0;\n'
+        '    PE_parse_boot_argn("pong_adsp", &mode, sizeof mode);',
+        'void adspThread(void *, wait_result_t) {\n'
+        '    thread_set_thread_name(current_thread(), "pong_adsp");\n'
+        '    unsigned mode = 0;\n'
+        '    PE_parse_boot_argn("pong_adsp", &mode, sizeof mode);\n'
+        '    if (!mode) {\n'
+        '        releaseFirmwareScratch();\n'
+        '        return;\n'
+        '    }\n'
+        '    for (unsigned waited = 0; pong_ufs_ready && !pong_ufs_ready() && waited < 300; ++waited) {\n'
+        '        IOSleep(100);\n'
+        '    }\n'
+        '    IOSleep(3000);\n'
+        '    IOLog("PongAdsp: starting deferred worker mode=%u ufs_ready=%d\\n",\n'
+        '          mode, pong_ufs_ready ? (pong_ufs_ready() ? 1 : 0) : -1);\n'
+        '    if (pong_log_panic_flush) pong_log_panic_flush();',
+    )
+    replace_exact(
+        adsp,
+        '    stage(StSurveyed);\n    const bool loaded=mode>=2 && start();',
+        '    stage(StSurveyed);\n'
+        '    IOLog("PongAdsp: surveyed; entering PAS start=%d\\n", mode >= 2 ? 1 : 0);\n'
+        '    if (pong_log_panic_flush) pong_log_panic_flush();\n'
+        '    const bool loaded=mode>=2 && start();',
+    )
 
 
 def patch_userland_ui(device: Path) -> None:
@@ -568,6 +605,74 @@ def patch_userland_ui(device: Path) -> None:
     )
 
 
+def patch_console_loghook(device: Path) -> None:
+    """将 UFS 控制台抓包点提前到 disableConsoleOutput 之前，避免静音后丢日志。"""
+    hook = device / 'patches/xnu-ipados18/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-pong-console-loghook.patch'
+    raw = hook.read_bytes()
+    if b'\r' in raw:
+        raise ValueError(f'{hook} 不是 LF 行尾')
+    text = raw.decode('utf-8')
+    if 'cons_ops[idx].putc(c, poll);' not in text:
+        raise ValueError(f'{hook} 缺少预期的 _cnputc 基线，拒绝重复应用或覆盖')
+    updated = (
+        'diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c\n'
+        '--- a/osfmk/console/serial_console.c\n'
+        '+++ b/osfmk/console/serial_console.c\n'
+        '@@ -112,6 +112,22 @@\n'
+        ' \n'
+        ' extern int serial_getc(void);\n'
+        ' extern void serial_putc_options(char, bool);\n'
+        '+extern void pong_log_putc(char c) __attribute__((weak_import));\n'
+        '+int pong_console_muted;\n'
+        '+\n'
+        '+static inline void\n'
+        '+pong_log_write_chars(const char *str, int size)\n'
+        '+{\n'
+        '+\tif (!pong_log_putc || str == NULL || size <= 0) {\n'
+        '+\t\treturn;\n'
+        '+\t}\n'
+        '+\tfor (int idx = 0; idx < size; idx++) {\n'
+        '+\t\tif (str[idx] == \'\\n\') {\n'
+        '+\t\t\tpong_log_putc(\'\\r\');\n'
+        '+\t\t}\n'
+        '+\t\tpong_log_putc(str[idx]);\n'
+        '+\t}\n'
+        '+}\n'
+        ' \n'
+        ' #if DEBUG || DEVELOPMENT\n'
+        ' TUNABLE(bool, allow_printf_from_interrupts_disabled_context, "nointr_consio", false);\n'
+        '@@ -261,6 +277,8 @@\n'
+        ' \t}\n'
+        ' \n'
+        '-\tcons_ops[idx].putc(c, poll);\n'
+        '+\tif (!pong_console_muted) {\n'
+        '+\t\tcons_ops[idx].putc(c, poll);\n'
+        '+\t}\n'
+        ' }\n'
+        ' \n'
+        ' /**\n'
+        '@@ -527,7 +545,8 @@\n'
+        ' void\n'
+        ' console_write(char *str, int size)\n'
+        ' {\n'
+        '+\tpong_log_write_chars(str, size);\n'
+        ' #if defined(PONG) && defined(XNU_PONG_RAMOOPS_CONSOLE) && XNU_PONG_RAMOOPS_CONSOLE\n'
+        ' \tpong_ramoops_console_write(str, size);\n'
+        ' #endif\n'
+        ' \tif (disableConsoleOutput) {\n'
+        '@@ -615,7 +634,8 @@\n'
+        ' void\n'
+        ' console_write_unbuffered(char c)\n'
+        ' {\n'
+        '+\tpong_log_write_chars(&c, 1);\n'
+        ' #if defined(PONG) && defined(XNU_PONG_RAMOOPS_CONSOLE) && XNU_PONG_RAMOOPS_CONSOLE\n'
+        ' \tpong_ramoops_console_write(&c, 1);\n'
+        ' #endif\n'
+        ' \tif (disableConsoleOutput) {\n'
+    )
+    hook.write_bytes(updated.encode('utf-8'))
+
+
 def apply(device: Path) -> None:
     """对独立设备目录应用第一波全部性能与板级驱动补丁。"""
     patch_cpu_policy(device)
@@ -576,6 +681,7 @@ def apply(device: Path) -> None:
     patch_touch_and_hall(device)
     patch_power_backlight_adsp(device)
     patch_userland_ui(device)
+    patch_console_loghook(device)
 
 
 def main() -> None:

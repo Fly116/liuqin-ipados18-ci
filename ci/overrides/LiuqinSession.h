@@ -4,6 +4,7 @@
 #include <kern/thread.h>
 
 extern "C" int liuqin_pmic_poweroff(void) __attribute__((weak_import));
+extern "C" void pong_log_panic_flush(void) __attribute__((weak_import));
 static int (*pong_previous_halt_restart)(unsigned int);
 static uint32_t pong_panic_latched;
 static uint32_t liuqin_panic_reset, liuqin_halt_reset;
@@ -35,13 +36,18 @@ static int pong_halt_restart(unsigned int type)
         type == kPEPanicRestartCPUNoCallouts) {
         __atomic_store_n(&pong_panic_latched, 1, __ATOMIC_RELEASE);
         /* PanicBegin 发生在日志生成前，只能在收尾的 Restart 请求复位。 */
-        if (type != kPEPanicBegin && liuqin_panic_reset)
+        if (type != kPEPanicBegin && liuqin_panic_reset) {
+            if (pong_log_panic_flush) pong_log_panic_flush();
             liuqin_reset();
+        }
         return pong_previous_halt_restart ? pong_previous_halt_restart(type) : -1;
     }
     if (type == kPEHaltCPU || type == kPERestartCPU) {
         if (__atomic_load_n(&pong_panic_latched, __ATOMIC_ACQUIRE)) {
-            if (liuqin_panic_reset) liuqin_reset();
+            if (liuqin_panic_reset) {
+                if (pong_log_panic_flush) pong_log_panic_flush();
+                liuqin_reset();
+            }
             return pong_previous_halt_restart ? pong_previous_halt_restart(type) : -1;
         }
         if (type == kPEHaltCPU && liuqin_halt_reset) type = kPERestartCPU;
@@ -69,8 +75,8 @@ static void liuqin_session_worker(void *, wait_result_t)
         clock_get_system_microtime(&seconds, &micros);
         if (liuqin_uptime && seconds >= liuqin_uptime) {
             IOLog("LIUQIN_SESSION: uptime deadline %u, reset after log flush\n", liuqin_uptime);
-            /* UFS 控制台线程每五秒落盘；留出一次完整刷写周期。 */
-            IOSleep(6000);
+            /* UFS 控制台线程每秒落盘；留出完整刷写窗口避免丢失尾部日志。 */
+            IOSleep(2500);
             liuqin_reset();
             liuqin_uptime = 0;
         }

@@ -46,6 +46,20 @@ def main():
     assert '0x9fd00000' in (device / 'drivers/PongPower/PongAdsp.cpp').read_text(encoding='utf-8')
     assert 'PONG_IOSURFACE_PADDING' in (device / 'userland/ui_compat18.c').read_text(encoding='utf-8')
     assert (device / 'drivers/PongPower/LiuqinBacklight.cpp').is_file()
+    ufs_text = (device / 'drivers/NativeUfs/PongUfsTransport.cpp').read_text(encoding='utf-8')
+    assert '(bytes + 4095u) / 4096' in ufs_text
+    assert 'pong_log_panic_flush' in ufs_text
+    assert 'IOSleep(1000);' in ufs_text
+    assert 'length &= ~4095u;' not in ufs_text
+    session_text = (device / 'drivers/ArmDTPlatform/LiuqinSession.h').read_text(encoding='utf-8')
+    assert 'pong_log_panic_flush' in session_text
+    assert 'IOSleep(2500);' in session_text
+    adsp_text = (device / 'drivers/PongPower/PongAdsp.cpp').read_text(encoding='utf-8')
+    assert 'pong_ufs_ready' in adsp_text
+    assert 'starting deferred worker' in adsp_text
+    assert (device / 'patches/xnu-ipados18' / ('z' * 96 + '-liuqin-icache-phystokv.patch')).is_file()
+    loghook_text = (device / 'patches/xnu-ipados18/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-pong-console-loghook.patch').read_text(encoding='utf-8')
+    assert 'pong_log_write_chars' in loghook_text
     repeat_device = subprocess.run([sys.executable, '-I', str(here / 'patch-device.py'),
                                     str(device)], capture_output=True)
     assert repeat_device.returncode != 0, '设备补丁重复应用必须失败'

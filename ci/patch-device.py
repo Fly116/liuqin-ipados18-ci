@@ -95,6 +95,35 @@ def main():
     replace(ufs, '    if (gPongLogEnabled || !layout.imageBytes) return;',
             '    if (gPongLogEnabled || !layout.imageBytes) return;\n'
             '    PE_parse_boot_argn("pong_log_flushes", &gPongLogMaxFlushes, sizeof(gPongLogMaxFlushes));')
+    replace(ufs, '    const uint32_t blocks = bytes / 4096;',
+            '    const uint32_t blocks = (bytes + 4095u) / 4096;')
+    replace(ufs,
+            '    length &= ~4095u;\n'
+            '    if (start & 4095u) start -= start & 4095u; // keep block-aligned source',
+            '    if (start & 4095u) start -= start & 4095u; // keep block-aligned source')
+    replace(ufs,
+            '    if (ok) { gPongLogWritten = head; ++gPongLogFlushes; }\n'
+            '}\n\n'
+            'static void pongLogThread(void *, wait_result_t)\n'
+            '{\n'
+            '    for (;;) {\n'
+            '        IOSleep(5000);\n'
+            '        pongLogFlush();\n'
+            '    }\n'
+            '}',
+            '    if (ok) { gPongLogWritten = head; ++gPongLogFlushes; }\n'
+            '}\n\n'
+            'extern "C" void pong_log_panic_flush(void)\n'
+            '{\n'
+            '    pongLogFlush();\n'
+            '}\n\n'
+            'static void pongLogThread(void *, wait_result_t)\n'
+            '{\n'
+            '    for (;;) {\n'
+            '        IOSleep(1000);\n'
+            '        pongLogFlush();\n'
+            '    }\n'
+            '}')
     patch_liuqin_wave1.apply(device)
     print('已应用 liuqin 会话复位、日志时限、ramoops 地址、引导记录保留及第一波性能驱动适配')
 
