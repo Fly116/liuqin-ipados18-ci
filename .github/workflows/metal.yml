@@ -49,8 +49,9 @@ jobs:
           git init mesa-git
           git -C mesa-git remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
           git -C mesa-git fetch --depth 1 origin "$MESA_REF"
-          python3 device/scripts/prepare-pong-mesa.py --repository mesa-git --out mesa-pong
-          python3 ci/patch-turnip.py mesa-pong
+          python3 device/scripts/prepare-pong-mesa.py --repository mesa-git --out "$RUNNER_TEMP/mesa-pong"
+          test -f "$RUNNER_TEMP/mesa-pong/src/freedreno/vulkan/tu_knl_darwin.cc"
+          python3 ci/patch-turnip.py "$RUNNER_TEMP/mesa-pong"
           mkdir tools-bin
           ln -s "$(command -v glslangValidator)" tools-bin/glslangValidator
           python3 device/kits/PongPlatform24/build-with-runtime.py --overlay-only --overlay-dir overlay
@@ -59,7 +60,7 @@ jobs:
           set -euo pipefail
           export PONG_NINJA="$PWD/venv/bin/ninja"
           python3 overlay/scripts/build-pong-turnip.py \
-            --mesa "$PWD/mesa-pong" \
+            --mesa "$RUNNER_TEMP/mesa-pong" \
             --abi-directory "$PWD/device/drivers/PongAdreno/submit" \
             --tools-directory "$PWD/tools-bin" --venv "$PWD/venv" \
             --guest-build 22H374 --output-dir "$PWD/turnip-build"
