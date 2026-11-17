@@ -1,0 +1,92 @@
+name: metal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: metal-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  QPRS_REF: 38ca105d915283d6c5342063965ab13572288e8a
+  MESA_REF: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+
+jobs:
+  metal:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: QPRS-6/iPadOS18-liuqin
+          ref: ${{ env.QPRS_REF }}
+          path: upstream
+          persist-credentials: false
+      - name: Prepare tools and device source
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test "${#ARTIFACT_PASSWORD}" -ge 12
+          test "$(uname -m)" = x86_64
+          brew install glslang bison flex sevenzip
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          python3 ci/prepare-device.py upstream device
+          python3 -m venv venv
+          venv/bin/python -m pip install --disable-pip-version-check 'meson==1.12.1' ninja mako pyyaml packaging
+      - name: Prepare pinned Mesa with liuqin cache fix
+        run: |
+          set -euo pipefail
+          git init mesa-git
+          git -C mesa-git remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
+          git -C mesa-git fetch --depth 1 origin "$MESA_REF"
+          python3 device/scripts/prepare-pong-mesa.py --repository mesa-git --out mesa-pong
+          python3 ci/patch-turnip.py mesa-pong
+          mkdir tools-bin
+          ln -s "$(command -v glslangValidator)" tools-bin/glslangValidator
+          python3 device/kits/PongPlatform24/build-with-runtime.py --overlay-only --overlay-dir overlay
+      - name: Build Darwin Turnip
+        run: |
+          set -euo pipefail
+          export PONG_NINJA="$PWD/venv/bin/ninja"
+          python3 overlay/scripts/build-pong-turnip.py \
+            --mesa "$PWD/mesa-pong" \
+            --abi-directory "$PWD/device/drivers/PongAdreno/submit" \
+            --tools-directory "$PWD/tools-bin" --venv "$PWD/venv" \
+            --guest-build 22H374 --output-dir "$PWD/turnip-build"
+      - name: Build Metal plugin bundle
+        run: |
+          set -euo pipefail
+          python3 overlay/scripts/build-pong-metal-plugin.py \
+            --bridge-directory "$PWD/device/metal/bridge" \
+            --turnip-library "$PWD/turnip-build/src/freedreno/vulkan/libvulkan_freedreno.dylib" \
+            --guest-build 22H374 --output-dir "$PWD/runtime"
+          codesign --verify --strict runtime/PongAdrenoMetal.bundle/PongAdrenoMetal
+          file runtime/PongAdrenoMetal.bundle/*
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          python3 ci/collect-metal.py
+      - name: Encrypt products
+        if: always()
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+        run: |
+          python3 ci/encrypt-products.py products upload/metal.7z
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-encrypted
+          path: upload/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
