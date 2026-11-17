@@ -97,11 +97,11 @@ jobs:
           PRELINK: ${{ inputs.prelink }}
         run: |
           set -euo pipefail
-          args=()
+          args=(--os ipados-18.7.10-22H374)
           if [ "$PRELINK" != true ]; then args+=(--skip-prelink); fi
           python3 ./unixnu build kernel -D ../device --local ../device -j 2 \
             --local-module "soc:sm8475=$GITHUB_WORKSPACE/device/migration/format2/soc-seed" \
-            --os ipados-18.7.10-22H374 "${args[@]}" 2>&1 | tee ../kernel-build.log
+            "${args[@]}" 2>&1 | tee ../kernel-build.log
       - name: Collect diagnostics and kernel products
         if: always()
         run: |
