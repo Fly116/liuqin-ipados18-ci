@@ -1,0 +1,119 @@
+name: kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      userdata_run_id:
+        description: 'Userdata run whose real volume layout this kernel mounts'
+        type: string
+        required: true
+      prelink:
+        description: 'Include original 22H374 APFS and other required components'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  QPRS_REF: 38ca105d915283d6c5342063965ab13572288e8a
+  UNIXNU_REF: c96b29975645b711dc06bc435c3ad27321ce817c
+  UNIXNU_SHARED_XNU_BUILD: '0'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+
+jobs:
+  kernel:
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: QPRS-6/iPadOS18-liuqin
+          ref: ${{ env.QPRS_REF }}
+          path: upstream
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ env.UNIXNU_REF }}
+          path: UniXNU
+          persist-credentials: false
+      - name: Prepare tools and device source
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test "${#ARTIFACT_PASSWORD}" -ge 12
+          test "$(uname -m)" = x86_64
+          brew install dtc lzfse sevenzip
+          for t in cmake ninja make unifdef python3; do command -v "$t"; done
+          python3 ci/prepare-device.py upstream device
+          python3 ci/patch-device.py device
+      - name: Restore private device firmware
+        env:
+          ADRENO_PART_01: ${{ secrets.ADRENO_PART_01 }}
+          ADRENO_PART_02: ${{ secrets.ADRENO_PART_02 }}
+          ADRENO_MANIFEST: ${{ secrets.ADRENO_MANIFEST }}
+        run: |
+          python3 ci/restore-firmware.py device/firmware/adreno730
+      - name: Fetch actual userland volume layout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          USERDATA_RUN_ID: ${{ inputs.userdata_run_id }}
+        run: |
+          set -euo pipefail
+          case "$USERDATA_RUN_ID" in *[!0-9]*|'') exit 1 ;; esac
+          python3 ci/fetch-volume-layout.py "$USERDATA_RUN_ID" volume-input
+          python3 ci/check-volumes.py volume-input/volume-layout.json
+          python3 ci/setup-kernel.py
+      - name: Install OS profile and aggregate recipe
+        run: |
+          set -euo pipefail
+          python3 device/scripts/install-unixnu-inputs.py --unixnu UniXNU
+          python3 device/scripts/patch-unixnu-kernel-step.py --unixnu UniXNU
+      - name: Select configuration and fetch kernelcache
+        working-directory: UniXNU
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 ./unixnu defconfig liuqin_ipados18_defconfig -D ../device
+          python3 ./unixnu ipsw fetch KernelCache -D ../device
+      - name: Derive GPU prelink bindings from the real cache
+        run: |
+          python3 ci/prelink-bindings.py device UniXNU/out/ipsw/22H374/kernelcache.decompressed
+      - name: Build kernel with required prelink
+        working-directory: UniXNU
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PONG_ADRENO_FIRMWARE: ${{ github.workspace }}/device/firmware/adreno730
+          PRELINK: ${{ inputs.prelink }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$PRELINK" != true ]; then args+=(--skip-prelink); fi
+          python3 ./unixnu build kernel -D ../device --local ../device -j 2 \
+            --os ipados-18.7.10-22H374 "${args[@]}" 2>&1 | tee ../kernel-build.log
+      - name: Collect diagnostics and kernel products
+        if: always()
+        run: |
+          python3 ci/collect-kernel.py
+      - name: Encrypt products
+        if: always()
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+        run: |
+          python3 ci/encrypt-products.py products upload/kernel.7z
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-encrypted
+          path: upload/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0

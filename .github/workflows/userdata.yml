@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       metal_run_id:
-        description: 'Successful metal workflow run ID; empty builds software-rendered diagnostics only'
+        description: 'Metal artifact run ID with a complete runtime; empty builds software diagnostics only'
         type: string
         default: ''
       upload_image:
@@ -74,10 +74,14 @@ jobs:
         run: |
           set -euo pipefail
           case "$METAL_RUN_ID" in *[!0-9]*|'') exit 1 ;; esac
-          gh run watch "$METAL_RUN_ID" -R "$GITHUB_REPOSITORY" --interval 60 --exit-status
+          gh run watch "$METAL_RUN_ID" -R "$GITHUB_REPOSITORY" --interval 60
           gh run download "$METAL_RUN_ID" -R "$GITHUB_REPOSITORY" -n metal-encrypted -D metal-download
           7zz x -y -bso0 "-p${ARTIFACT_PASSWORD}" -ometal-products metal-download/metal.7z
           test -f metal-products/runtime/build-report.json
+          codesign --force --sign - --pagesize 4096 metal-products/runtime/PongAdrenoMetal.bundle
+          codesign --verify --strict metal-products/runtime/PongAdrenoMetal.bundle
+          codesign --verify --strict metal-products/runtime/PongAdrenoMetal.bundle/PongMetalBridge.dylib
+          codesign --verify --strict metal-products/runtime/PongAdrenoMetal.bundle/libvulkan_freedreno.dylib
           sudo "$PWD/userland-venv/bin/python" device/userland/build-ipados18.py refresh_metal \
             --out "$RUNNER_TEMP/userland" --runtime "$PWD/metal-products/runtime"
       - name: Build hashed SHNGROOT layout

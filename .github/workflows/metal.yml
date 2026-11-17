@@ -71,7 +71,10 @@ jobs:
             --bridge-directory "$PWD/device/metal/bridge" \
             --turnip-library "$PWD/turnip-build/src/freedreno/vulkan/libvulkan_freedreno.dylib" \
             --guest-build 22H374 --output-dir "$PWD/runtime"
-          codesign --verify --strict runtime/PongAdrenoMetal.bundle/PongAdrenoMetal
+          codesign --force --sign - --pagesize 4096 runtime/PongAdrenoMetal.bundle
+          codesign --verify --strict runtime/PongAdrenoMetal.bundle
+          codesign --verify --strict runtime/PongAdrenoMetal.bundle/PongMetalBridge.dylib
+          codesign --verify --strict runtime/PongAdrenoMetal.bundle/libvulkan_freedreno.dylib
           file runtime/PongAdrenoMetal.bundle/*
       - name: Collect diagnostics
         if: always()
