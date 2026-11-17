@@ -89,6 +89,9 @@ jobs:
       - name: Derive GPU prelink bindings from the real cache
         run: |
           python3 ci/prelink-bindings.py device UniXNU/out/ipsw/22H374/kernelcache.decompressed
+      - name: Build userland UI compatibility library
+        run: |
+          python3 ci/build-ui-library.py device products-ui
       - name: Build kernel with required prelink
         working-directory: UniXNU
         env:
@@ -102,9 +105,6 @@ jobs:
           python3 ./unixnu build kernel -D ../device --local ../device -j 2 \
             --local-module "soc:sm8475=$GITHUB_WORKSPACE/device/migration/format2/soc-seed" \
             "${args[@]}" 2>&1 | tee ../kernel-build.log
-      - name: Build userland UI compatibility library
-        run: |
-          python3 ci/build-ui-library.py device products-ui
       - name: Collect diagnostics and kernel products
         if: always()
         run: |

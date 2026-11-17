@@ -491,7 +491,7 @@ def patch_power_backlight_adsp(device: Path) -> None:
         '}\n'
         'int openImage(Image &image, const char *path) {\n'
         '    DTEntry chosen = nullptr;\n'
-        '    void *prop = nullptr;\n'
+        '    const void *prop = nullptr;\n'
         '    unsigned propSize = 0;\n'
         '    if (strcmp(path, "/pong/firmware/adsp.mbn") == 0 &&\n'
         '        SecureDTLookupEntry(nullptr, "/chosen", &chosen) == kSuccess &&\n'
