@@ -1,0 +1,89 @@
+diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -625,6 +625,25 @@
+ osdata_kext_free(void * ptr, unsigned int length)
+ {
+ 	(void)kext_free((vm_offset_t)ptr, length);
++}
++};
++
++extern "C" {
++bool
++liuqin_oskext_lock_if_ready(void)
++{
++	/* 严格遵守 sKextLock -> sStalledClassesLock 锁序，避免与多核 kext 加载发生 AB-BA 死锁。 */
++	if (!sKextLock) {
++		return false;
++	}
++	IORecursiveLockLock(sKextLock);
++	return true;
++}
++
++void
++liuqin_oskext_unlock(void)
++{
++	IORecursiveLockUnlock(sKextLock);
+ }
+ };
+ 
+diff --git a/libkern/c++/OSMetaClass.cpp b/libkern/c++/OSMetaClass.cpp
+--- a/libkern/c++/OSMetaClass.cpp
++++ b/libkern/c++/OSMetaClass.cpp
+@@ -62,6 +62,9 @@
+ #include <mach/mach_interface.h>
+ #include <stddef.h>
+ 
++bool liuqin_oskext_lock_if_ready(void);
++void liuqin_oskext_unlock(void);
++
+ #if PRAGMA_MARK
+ #pragma mark Macros
+ #endif /* PRAGMA_MARK */
+@@ -107,6 +110,7 @@
+ 	OSMetaClass ** classes;
+ } * sStalled;
+ IOLock * sStalledClassesLock = NULL;
++static bool sStalledLockedKext = false;
+ 
+ struct ExpansionData {
+ 	OSOrderedSet    * instances;
+@@ -779,7 +783,11 @@
+ void *
+ OSMetaClass::preModLoad(const char * kextIdentifier)
+ {
++	/* postModLoad() 内部会调用 OSKext::lookupKextWithIdentifier() 获取 sKextLock，
++	 * 因此必须在获取 sStalledClassesLock 之前先持递归锁 sKextLock。 */
++	bool lockedKext = liuqin_oskext_lock_if_ready();
+ 	IOLockLock(sStalledClassesLock);
++	sStalledLockedKext = lockedKext;
+ 
+ 	assert(sStalled == NULL);
+ 	sStalled = kalloc_type(StalledData, Z_WAITOK_ZERO_NOFAIL);
+@@ -788,6 +796,12 @@
+ 	    kKModCapacityIncrement, Z_WAITOK_ZERO, VM_KERN_MEMORY_OSKEXT);
+ 	if (!sStalled->classes) {
+ 		kfree_type(StalledData, sStalled);
++		sStalled = NULL;
++		sStalledLockedKext = false;
++		IOLockUnlock(sStalledClassesLock);
++		if (lockedKext) {
++			liuqin_oskext_unlock();
++		}
+ 		return NULL;
+ 	}
+ 	OSMETA_ACCUMSIZE((kKModCapacityIncrement * sizeof(OSMetaClass *)) +
+@@ -973,7 +987,13 @@
+ 	        sStalled = NULL;
+ 	}
+ 
++	bool unlockKext = sStalledLockedKext;
++	sStalledLockedKext = false;
++
+ 	IOLockUnlock(sStalledClassesLock);
++	if (unlockKext) {
++		liuqin_oskext_unlock();
++	}
+ 
+ 	return result;
+ }

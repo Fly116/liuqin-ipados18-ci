@@ -58,6 +58,22 @@ def main():
     assert 'pong_ufs_ready' in adsp_text
     assert 'starting deferred worker' in adsp_text
     assert (device / 'patches/xnu-ipados18' / ('z' * 96 + '-liuqin-icache-phystokv.patch')).is_file()
+    lock_patch = device / 'patches/xnu-ipados18' / ('z' * 98 + '-liuqin-osmetaclass-kextlock.patch')
+    assert lock_patch.is_file()
+    assert b'\r' not in lock_patch.read_bytes()
+    assert 'liuqin_oskext_lock_if_ready' in lock_patch.read_text(encoding='utf-8')
+    usb_phy_text = (device / 'drivers/PongUsb/PongUsbPhy.h').read_text(encoding='utf-8')
+    assert '{{6,0x40},{7,0x00},{8,0x63},{0x0a,0x03}}' in usb_phy_text
+    usb_dev_text = (device / 'drivers/PongUsb/PongUsbDevice.h').read_text(encoding='utf-8')
+    assert 'log.open(0xa7000000,0x200000);' in usb_dev_text
+    assert 'liuqin_usb_vbus' in usb_dev_text
+    xnu_src = args.source.parent / 'xnu-22H374'
+    if (xnu_src / 'libkern/c++/OSMetaClass.cpp').is_file():
+        chk_root = args.scratch / 'xnu-check'
+        (chk_root / 'libkern/c++').mkdir(parents=True)
+        for rel in ('libkern/c++/OSKext.cpp', 'libkern/c++/OSMetaClass.cpp'):
+            shutil.copy2(xnu_src / rel, chk_root / rel)
+        subprocess.run(['git', 'apply', '--check', str(lock_patch)], cwd=chk_root, check=True)
     loghook_text = (device / 'patches/xnu-ipados18/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-pong-console-loghook.patch').read_text(encoding='utf-8')
     assert 'pong_log_write_chars' in loghook_text
     repeat_device = subprocess.run([sys.executable, '-I', str(here / 'patch-device.py'),

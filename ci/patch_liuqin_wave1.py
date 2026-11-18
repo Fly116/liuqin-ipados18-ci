@@ -18,6 +18,7 @@ TOUCH_PATCHES = (
 
 EXTRA_XNU_PATCHES = (
     'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-liuqin-icache-phystokv.patch',
+    'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-liuqin-osmetaclass-kextlock.patch',
 )
 
 GPU_OPPS = (
@@ -426,9 +427,40 @@ def patch_power_backlight_adsp(device: Path) -> None:
         'void pong_power_start_optional(void) {\n'
         ' pong_rpmh_init();\n'
         '#ifndef PONG_POWER_BACKLIGHT_ONLY\n'
-        ' // USB 与音频服务解耦，确保调试通道独立初始化；不接管 PE_halt_restart 以保留无人值守复位。\n'
-        ' PongUsb::start();\n'
-        ' (void)pong_audio_service_classes_ready();',
+        ' // 仅在显式启用 USB 或 ADSP 时预注册音频/USB 服务类，同时底层 OSMetaClass 已修复锁序死锁。\n'
+        ' unsigned usb_en=0,adsp_en=0;\n'
+        ' PE_parse_boot_argn("pong_usb",&usb_en,sizeof usb_en);\n'
+        ' PE_parse_boot_argn("pong_adsp",&adsp_en,sizeof adsp_en);\n'
+        ' if(usb_en==1 || adsp_en>=1)(void)pong_audio_service_classes_ready();\n'
+        ' PongUsb::start();',
+    )
+
+    replace_exact(
+        device / 'drivers/PongUsb/PongUsbPhy.h',
+        ' const uint8_t params[][2]={{6,0x40},{7,0x22},{8,0x64}};',
+        ' const uint8_t params[][2]={{6,0x40},{7,0x00},{8,0x63},{0x0a,0x03}};',
+    )
+    usb_dev = device / 'drivers/PongUsb/PongUsbDevice.h'
+    replace_exact(
+        usb_dev,
+        ' const char *value=index==1?(iphoneIdentity?"Apple Inc.":"UniXNU Pong"):\n'
+        '  index==2?(iphoneIdentity?"iPhone":muxEnabled?"Pong iOS USB + console":"Pong XNU console"):\n'
+        '  index==3?(native?serial:"PONG-SM8475"):index==4?"Pong XNU console":"";',
+        ' const char *value=index==1?(iphoneIdentity?"Apple Inc.":"UniXNU Liuqin"):\n'
+        '  index==2?(iphoneIdentity?"iPhone":muxEnabled?"Liuqin iOS USB + console":"Liuqin XNU console"):\n'
+        '  index==3?(native?serial:"LIUQIN-SM8475"):index==4?"Liuqin XNU console":"";',
+    )
+    replace_exact(
+        usb_dev,
+        ' core.w(DWC3_DEVTEN,0xf);log.open(0x85200000,0x200000);',
+        ' core.w(DWC3_DEVTEN,0xf);log.open(0xa7000000,0x200000);',
+    )
+    replace_exact(
+        usb_dev,
+        ' const int online=pong_battery_usb_online();if(online<0 || bool(online)==cableConnected)return;',
+        ' int online=pong_battery_usb_online();\n'
+        ' if(online<0){unsigned vbus=0;PE_parse_boot_argn("liuqin_usb_vbus",&vbus,sizeof vbus);if(vbus==1)online=1;}\n'
+        ' if(online<0 || bool(online)==cableConnected)return;',
     )
 
     adsp = device / 'drivers/PongPower/PongAdsp.cpp'
