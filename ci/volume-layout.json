@@ -1,0 +1,13 @@
+{
+  "ci_placeholder": false,
+  "note": "Volume UUIDs of the 22H374 userdata image this workstation holds (Fly116/liuqin-ipados18-ci run 44851228174); uppercase as IOMedia prints them.",
+  "os": {
+    "uuid": "B07DF049-7AD9-47B5-9F8F-9EE728056398"
+  },
+  "systemos": {
+    "uuid": "5D08420A-43CD-43AD-8B1B-1E8F5B86AB0A"
+  },
+  "data": {
+    "uuid": "5DF4DC0A-9451-4994-A495-1554A8AC42A2"
+  }
+}
