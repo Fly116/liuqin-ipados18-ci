@@ -1,0 +1,229 @@
+name: kernel-upstream
+
+# Build the kernel from the current upstream device tree (document97/UniXNU-liuqin)
+# instead of the QPRS-6 drop this repository was pinned to. That tree carries
+#   * slide = "auto" for the prelink, derived from the 22H374 kernelcache,
+#   * the 2026-11-21 UFS/SMMU fixes,
+#   * its own patch-unixnu-kernel-step.py and OS profile.
+# Only the kernel and payload products are collected; the boot image is assembled
+# on the workstation, which is where the board's stock Cape DTB lives.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_ref:
+        description: 'document97/UniXNU-liuqin commit to build'
+        required: true
+        default: 'fe0e8d790e24120970083e20c1a7d9c86cdbb87c'
+      unique_chip_id:
+        description: 'Platform seed for the ADT, 8 hexadecimal digits'
+        required: true
+        default: '84750a0b'
+      prelink:
+        description: 'Prelink the extracted 22H374 kernelcache into kernel.macho'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  UNIXNU_REF: c96b29975645b711dc06bc435c3ad27321ce817c
+  UNIXNU_SHARED_XNU_BUILD: '0'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+  LLVM_KEG: /usr/local/opt/llvm@18
+  LLD_KEG: /usr/local/opt/lld
+
+jobs:
+  kernel:
+    runs-on: macos-15-intel
+    timeout-minutes: 300
+    steps:
+      - name: artifact password
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test "${#ARTIFACT_PASSWORD}" -ge 12
+          command -v 7zz >/dev/null || brew install sevenzip
+
+      # This repository, only for ci/volume-layout.json.
+      - uses: actions/checkout@v4
+        with:
+          path: ci-repo
+          persist-credentials: false
+
+      - name: checkout the upstream device tree
+        uses: actions/checkout@v4
+        with:
+          repository: document97/UniXNU-liuqin
+          ref: ${{ inputs.device_ref }}
+          path: device
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ env.UNIXNU_REF }}
+          path: UniXNU
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Document97/uefi-liuqin
+          ref: liuqin
+          path: uefi-liuqin
+          submodules: recursive
+          persist-credentials: false
+
+      - name: reclaim disk
+        run: |
+          set -euo pipefail
+          selected="$(xcode-select -p)"
+          need=$((80 * 1024 * 1024))
+          avail="$(df -k / | awk 'NR==2 {print $4}')"
+          echo "avail_kb=${avail} need_kb=${need}"
+          if [ "$avail" -lt "$need" ]; then
+            for app in /Applications/Xcode*.app; do
+              [ -d "$app" ] || continue
+              case "$selected" in
+                "$app"/*) echo "keep $app" ;;
+                *) echo "remove $app"; sudo rm -rf "$app" ;;
+              esac
+            done
+          fi
+          sudo rm -rf /Library/Developer/CoreSimulator/Caches /Library/Developer/CoreSimulator/Devices || true
+          rm -rf "$HOME/Library/Developer/CoreSimulator" "$HOME/Library/Developer/Xcode/DerivedData" || true
+          df -h
+
+      - name: tools
+        run: |
+          set -euo pipefail
+          brew install dtc lzfse mtools nasm acpica ccache || true
+          ok=1
+          for t in dtc lzfse mformat mcopy nasm iasl cmake ninja make unifdef python3; do
+            command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
+          done
+          [ "$ok" = 1 ]
+
+      - name: platform seed
+        env:
+          CHIP_ID: ${{ inputs.unique_chip_id }}
+        run: |
+          set -euo pipefail
+          chip="$(printf '%s' "${CHIP_ID}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          printf '%s' "$chip" | grep -Eq '^[0-9a-f]{8}$' || {
+            echo 'unique_chip_id must be 8 hexadecimal digits' >&2; exit 1; }
+          echo "UNIXNU_UNIQUE_CHIP_ID=$chip" >> "$GITHUB_ENV"
+          echo "platform seed $chip"
+
+      - name: install the OS profile and the component recipe
+        run: |
+          set -euo pipefail
+          python3 device/scripts/install-unixnu-inputs.py --unixnu UniXNU
+          python3 device/scripts/patch-unixnu-kernel-step.py --unixnu UniXNU
+
+      - name: check the patch set
+        working-directory: device
+        run: python3 scripts/check-xnu-patches.py
+
+      - name: build inputs
+        run: |
+          set -euo pipefail
+          # The volume UUIDs the kernel is compiled with: the ones of the userdata
+          # image this workstation already holds (B07DF049 / 5D08420A / 5DF4DC0A).
+          cp -f ci-repo/ci/volume-layout.json ci-volume-layout.json
+          cat ci-volume-layout.json
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          developer = subprocess.check_output(['xcode-select', '-p'], text=True).strip()
+          lines = ['# Written on the runner; not a developer machine path.',
+                   '[pong_build]',
+                   'tree = ' + json.dumps(str(Path('tree').resolve())),
+                   'developer_dir = ' + json.dumps(developer),
+                   'volume_layout = ' + json.dumps(str(Path('ci-volume-layout.json').resolve())),
+                   '']
+          Path('device/local.toml').write_text('\n'.join(lines))
+          print(Path('device/local.toml').read_text())
+          PY
+          {
+            printf 'PONG_VOLUME_LAYOUT=%s\n' "$PWD/ci-volume-layout.json"
+            printf 'UNIXNU_DEVICE=%s\n' "$PWD/device"
+            printf 'PONG_LLVM=%s\n' "${LLVM_KEG}/bin"
+            printf 'PATH=%s/bin:%s/bin:%s\n' "${LLVM_KEG}" "${LLD_KEG}" "$PATH"
+            printf 'UNIXNU_UEFI=%s\n' "$PWD/uefi-liuqin"
+            printf 'XNU_SDKROOT=%s\n' "$(xcrun --sdk iphoneos --show-sdk-path)"
+            printf 'PONG_IOS_SDK=%s\n' "$(xcrun --sdk iphoneos --show-sdk-path)"
+            printf 'PONG_MIG=%s\n' "$(xcrun -f mig)"
+            printf 'PONG_MIGCOM=%s\n' "$(xcrun -f migcom)"
+          } >> "$GITHUB_ENV"
+
+      - name: select configuration and fetch kernelcache
+        working-directory: UniXNU
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 ./unixnu defconfig liuqin_ipados18_defconfig -D ../device \
+            --local-module "soc:sm8475=$GITHUB_WORKSPACE/device/migration/format2/soc-seed"
+          python3 ./unixnu ipsw fetch KernelCache -D ../device \
+            --local-module "soc:sm8475=$GITHUB_WORKSPACE/device/migration/format2/soc-seed"
+
+      - name: build the kernel
+        working-directory: UniXNU
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PRELINK: ${{ inputs.prelink }}
+        run: |
+          set -euo pipefail
+          args=(--os ipados-18.7.10-22H374)
+          if [ "$PRELINK" != true ]; then args+=(--skip-prelink); fi
+          set -o pipefail
+          python3 ./unixnu build kernel -D ../device --local ../device -j 3 \
+            --local-module "soc:sm8475=$GITHUB_WORKSPACE/device/migration/format2/soc-seed" \
+            "${args[@]}" 2>&1 | tee ../kernel-build.log
+
+      - name: collect products
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p products
+          src="$(find UniXNU/out -maxdepth 5 -type d -name liuqin_ipados18 | head -1)"
+          echo "source: ${src:-none}"
+          if [ -n "${src:-}" ]; then
+            for name in kernel payload; do
+              [ -d "$src/$name" ] && cp -a "$src/$name" "products/$name" || true
+            done
+            [ -d "$src/boot" ] && cp -a "$src/boot" products/boot || true
+          fi
+          cp -a UniXNU/out/liuqin/logs products/logs 2>/dev/null || true
+          cp kernel-build.log products/ 2>/dev/null || true
+          find products -maxdepth 2 -type f -printf '%s %p\n' 2>/dev/null | sort -k2 || find products -maxdepth 2 -type f | head -40
+
+      - name: encrypt products
+        if: always()
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.LIUQIN_ARTIFACT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          if [ -d products ]; then
+            7zz a -t7z -mx=1 -mhe=on "-p${ARTIFACT_PASSWORD}" upload/kernel-upstream.7z ./products > /dev/null
+            7zz t "-p${ARTIFACT_PASSWORD}" upload/kernel-upstream.7z | tail -3
+          else
+            echo 'no products directory'
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-upstream-encrypted
+          path: upload/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
