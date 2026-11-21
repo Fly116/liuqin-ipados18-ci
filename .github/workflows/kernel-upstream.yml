@@ -72,14 +72,6 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - uses: actions/checkout@v4
-        with:
-          repository: Document97/uefi-liuqin
-          ref: liuqin
-          path: uefi-liuqin
-          submodules: recursive
-          persist-credentials: false
-
       - name: reclaim disk
         run: |
           set -euo pipefail
@@ -143,7 +135,8 @@ jobs:
           set -euo pipefail
           python3 ./unixnu fetch -D ../device \
             --local-module "soc:sm8475=$GITHUB_WORKSPACE/device/migration/format2/soc-seed"
-          ls -la ../device/refer/ipados18/
+          ls -la ../device/refer/ipados18/ 2>/dev/null || \
+            echo "refer/ipados18 is seeded later by kits/PongPlatform24/build-kernel.py:40 seed_refer()"
 
       - name: build inputs
         run: |
@@ -170,7 +163,6 @@ jobs:
             printf 'UNIXNU_DEVICE=%s\n' "$PWD/device"
             printf 'PONG_LLVM=%s\n' "${LLVM_KEG}/bin"
             printf 'PATH=%s/bin:%s/bin:%s\n' "${LLVM_KEG}" "${LLD_KEG}" "$PATH"
-            printf 'UNIXNU_UEFI=%s\n' "$PWD/uefi-liuqin"
             printf 'XNU_SDKROOT=%s\n' "$(xcrun --sdk iphoneos --show-sdk-path)"
             printf 'PONG_IOS_SDK=%s\n' "$(xcrun --sdk iphoneos --show-sdk-path)"
             printf 'PONG_MIG=%s\n' "$(xcrun -f mig)"
