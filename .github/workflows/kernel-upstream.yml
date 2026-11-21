@@ -119,6 +119,28 @@ jobs:
           python3 device/scripts/install-unixnu-inputs.py --unixnu UniXNU
           python3 device/scripts/patch-unixnu-kernel-step.py --unixnu UniXNU
 
+      - name: bring-up configuration
+        run: |
+          set -euo pipefail
+          # The package job compiles QCA6490 (PongWifi) against a Linux v7.0.14 tree
+          # and UniXNU-sheng, and embeds firmware staged from the encrypted stock
+          # release. This workflow has only the public sources, and the kernel build
+          # refuses XNU_PONG_WIFI=1 / XNU_PONG_BACKLIGHT=1 rather than writing a stub.
+          # Both stay off for the boot bring-up: the ABL already enables the KTZ8866
+          # backlight, and the display path here is the software UI.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('device/configs/liuqin_ipados18_defconfig')
+          text = path.read_text()
+          for key in ('CONFIG_XNU_PONG_WIFI', 'CONFIG_XNU_PONG_BACKLIGHT'):
+              if key + '=y' not in text:
+                  raise SystemExit(f'{key}=y is not in {path}')
+              text = text.replace(key + '=y', key + '=n')
+          path.write_text(text)
+          print('wifi and backlight off for the bring-up build')
+          PY
+          grep -n "CONFIG_XNU_PONG_WIFI\|CONFIG_XNU_PONG_BACKLIGHT" device/configs/liuqin_ipados18_defconfig
+
       - name: check the patch set
         working-directory: device
         run: python3 scripts/check-xnu-patches.py
