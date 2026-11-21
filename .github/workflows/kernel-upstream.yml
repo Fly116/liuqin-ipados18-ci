@@ -131,6 +131,20 @@ jobs:
         working-directory: device
         run: python3 scripts/check-xnu-patches.py
 
+      # `unixnu release` runs its deps step first, which shallow-fetches the pinned
+      # sources into device/refer/ipados18/. The component recipe checks each
+      # checkout's HEAD against feeds.toml (build-ipados18-pong-macos.py:29-34), so a
+      # direct `build kernel` has to do the same fetch itself.
+      - name: fetch the pinned source feeds
+        working-directory: UniXNU
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 ./unixnu fetch -D ../device \
+            --local-module "soc:sm8475=$GITHUB_WORKSPACE/device/migration/format2/soc-seed"
+          ls -la ../device/refer/ipados18/
+
       - name: build inputs
         run: |
           set -euo pipefail
@@ -200,6 +214,7 @@ jobs:
               [ -d "$src/$name" ] && cp -a "$src/$name" "products/$name" || true
             done
             [ -d "$src/boot" ] && cp -a "$src/boot" products/boot || true
+            [ -d "$src/logs" ] && cp -a "$src/logs" products/logs || true
           fi
           cp -a UniXNU/out/liuqin/logs products/logs 2>/dev/null || true
           cp kernel-build.log products/ 2>/dev/null || true
