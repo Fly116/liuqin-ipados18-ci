@@ -152,6 +152,20 @@ jobs:
           echo "PONG_SHENG_ROOT=$root" >> "$GITHUB_ENV"
           echo "PONG_SHENG_ROOT=$root"
 
+      - name: apply local driver patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(ci-repo/ci/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "no ci/patches to apply"
+            exit 0
+          fi
+          for patch in "${patches[@]}"; do
+            echo "applying ${patch}"
+            git -C device apply -p1 --whitespace=nowarn "${patch}"
+          done
+
       - name: check the patch set
         working-directory: device
         run: python3 scripts/check-xnu-patches.py
