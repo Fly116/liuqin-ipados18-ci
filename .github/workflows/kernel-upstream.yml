@@ -244,7 +244,7 @@ jobs:
           cp -a UniXNU/out/liuqin/logs products/logs 2>/dev/null || true
           cp kernel-build.log products/ 2>/dev/null || true
           cp build-*.log products/ 2>/dev/null || true
-          find products -maxdepth 2 -type f -printf '%s %p\n' 2>/dev/null | sort -k2 || find products -maxdepth 2 -type f | head -40
+          find products -maxdepth 2 -type f | sort
 
       - name: encrypt products
         if: always()
