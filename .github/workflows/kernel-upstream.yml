@@ -141,6 +141,17 @@ jobs:
           PY
           grep -n "CONFIG_XNU_PONG_WIFI\|CONFIG_XNU_PONG_BACKLIGHT" device/configs/liuqin_ipados18_defconfig
 
+      - name: native board sources
+        run: |
+          set -euo pipefail
+          # PongPower (ADSP/battery) and the backlight path compile QcomRpmh out of
+          # UniXNU-sheng; the package job fetches the same pinned public source.
+          python3 device/scripts/fetch-pong-native-sources.py --only sheng_source
+          root="$GITHUB_WORKSPACE/device/refer/ipados18/UniXNU-sheng"
+          test -f "$root/package/QcomRpmh.c"
+          echo "PONG_SHENG_ROOT=$root" >> "$GITHUB_ENV"
+          echo "PONG_SHENG_ROOT=$root"
+
       - name: check the patch set
         working-directory: device
         run: python3 scripts/check-xnu-patches.py
