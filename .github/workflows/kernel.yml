@@ -54,6 +54,25 @@ jobs:
           for t in cmake ninja make unifdef python3; do command -v "$t"; done
           python3 ci/prepare-device.py upstream device
           python3 ci/patch-device.py device
+      - name: Derive the prelink slide from the 22H374 kernelcache layout
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('device/board.toml')
+          text = path.read_text()
+          # -0x1000000 is the 21H461 kernelcache base; an aggregate slid by it puts
+          # __PRELINK_TEXT at 0xfffffff004130000 while prepare-ipados18-storage.py
+          # pins the kexts the kernel calls at 0xfffffff00b000000. The 22H374
+          # cache's __PRELINK_TEXT starts at 0xfffffff005130000, so the correct
+          # rebase is 0xfffffff00b000000 - 0xfffffff005130000 = 0x5ed0000.
+          old = 'slide = "-0x1000000"'
+          new = 'slide = "0x5ed0000"'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one slide line, found {text.count(old)}')
+          path.write_text(text.replace(old, new))
+          print('prelink slide -> 0x5ed0000 (derived from the 22H374 cache base)')
+          PY
       - name: Restore private device firmware
         env:
           ADRENO_PART_01: ${{ secrets.ADRENO_PART_01 }}
