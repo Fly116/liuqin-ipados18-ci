@@ -1,0 +1,362 @@
+diff --git a/drivers/NativeUfs/NativeUfs.cpp b/drivers/NativeUfs/NativeUfs.cpp
+index 2bbc068..9a3d480 100644
+--- a/drivers/NativeUfs/NativeUfs.cpp
++++ b/drivers/NativeUfs/NativeUfs.cpp
+@@ -24,6 +24,7 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include "../PongProbe.h"
++#include "PongUfsPhyTables.h"
+ extern "C" bool pong_ufs_transport_start(IOService *);
+ 
+ extern "C" {
+@@ -87,14 +88,32 @@ constexpr unsigned kUicArg1 = 0x94;
+ constexpr unsigned kUicArg2 = 0x98;
+ constexpr unsigned kUicArg3 = 0x9c;
+ constexpr uint32_t kUicDone = 1U << 10;
++constexpr uint32_t kHcsUicReady = 1U << 3;     // HCS.UCRDY: UIC accepts a command
++// UIC opcodes and MIB attributes, from the vendor UfsDxe sequence and
++// SamsungPkg UfsHostBridge.h: DME_GET/DME_SET take the attribute in ARG_1,
++// the result code returns in ARG_2 and a DME_GET value in ARG_3.
++constexpr uint32_t kDmeGet = 0x01;
++constexpr uint32_t kDmeSet = 0x02;
++constexpr uint32_t kDmeReset = 0x14;
+ constexpr uint32_t kDmeLinkStartup = 0x16;
++constexpr uint32_t kMibAvailableTxLanes = 0x1540U << 16;
++constexpr uint32_t kMibActiveTxLanes = 0x1560U << 16;
++constexpr uint32_t kMibActiveRxLanes = 0x1580U << 16;
++constexpr uint32_t kMibMaxRxGear = 0x1587U << 16;
++constexpr uint32_t kMibRxGear = 0x1583U << 16;
++constexpr uint32_t kMibTxGear = 0x1568U << 16;
++constexpr uint32_t kMibRxTermination = 0x1584U << 16;
++constexpr uint32_t kMibTxTermination = 0x1569U << 16;
++constexpr uint32_t kMibHsSeries = 0x156AU << 16;
++constexpr uint32_t kMibPowerMode = 0x1571U << 16;
++constexpr uint32_t kUfsHsSeries = 2;          // UFS_RATE in the vendor driver
++constexpr uint32_t kUfsRxtxPowerMode = 0x11;  // (UFS_POWER_MODE << 4) | UFS_POWER_MODE
+ 
+ // Interrupt status bit2 is UIC error; HCS bit3 says the UIC accepts a command.
+ // A loader that tears UFS down leaves the UIC error latched while HCS keeps
+ // reporting the device present, because nobody clears either on the way out.
+ constexpr uint32_t kIsUicError = 1U << 2;
+ constexpr uint32_t kHcsDevicePresent = 1U << 0;
+-constexpr uint32_t kHcsUicReady = 1U << 3;
+ constexpr unsigned kUicErrorDataLink = 0x3c;
+ constexpr unsigned kInterruptStatus = 0x20;
+ 
+@@ -115,16 +134,22 @@ static void write32 (uintptr_t base, unsigned offset, uint32_t value)
+   *reinterpret_cast<volatile uint32_t *> (base + offset) = value;
+ }
+ 
+-static uint32_t uicLinkStartup (uintptr_t host)
++// One UIC command. Returns the ARG_2 result code (0 = accepted) and, when
++// value is non-null, ARG_3 (the DME_GET attribute value).
++static uint32_t uicCommand (uintptr_t host, uint32_t opcode, uint32_t arg1,
++                            uint32_t arg2, uint32_t arg3, uint32_t *value)
+ {
+-  write32 (host, kUicArg1, 0);
+-  write32 (host, kUicArg2, 0);
+-  write32 (host, kUicArg3, 0);
++  for (unsigned spin = 0; spin < 1000 && !(read32 (host, 0x30) & kHcsUicReady); ++spin)
++    IODelay (10);
++  write32 (host, kUicArg1, arg1);
++  write32 (host, kUicArg2, arg2);
++  write32 (host, kUicArg3, arg3);
+   write32 (host, 0x20, kUicDone);            // drop a stale completion
+-  write32 (host, kUicCommand, kDmeLinkStartup);
++  write32 (host, kUicCommand, opcode);
+   for (unsigned spin = 0; spin < 20000; ++spin) {
+     if (read32 (host, 0x20) & kUicDone) {
+       write32 (host, 0x20, kUicDone);
++      if (value) *value = read32 (host, kUicArg3);
+       return read32 (host, kUicArg2);        // result code in the low byte
+     }
+     IODelay (10);
+@@ -132,6 +157,87 @@ static uint32_t uicLinkStartup (uintptr_t host)
+   return 0xffffffffU;                        // never completed
+ }
+ 
++// ------------------------------- QMP PHY --------------------------------
++// Same sequence as Linux qcom-qmp-ufs-phy for v6 (SM8475 tables): programme
++// the SerDes/TX/RX/PCS registers, clear the PCS software reset, start SerDes,
++// then wait for PCS_READY. The second TX/RX lane block sits 0x800 further on.
++static void phyWriteTable (uintptr_t phy, unsigned block, const PongPhyReg *table, unsigned count)
++{
++  for (unsigned index = 0; index < count; ++index)
++    write32 (phy, block + table[index].offset, table[index].value);
++}
++
++static bool phyBringUp (uintptr_t phy)
++{
++  if (!phy) return false;
++  uint32_t readyBefore = read32 (phy, kPhyPcs + kPcsReady);
++  // PCS_POWER_DOWN_CONTROL bit0: set enables the block (Linux clears it when
++  // powering the PHY off).
++  write32 (phy, kPhyPcs + kPcsPowerDown, read32 (phy, kPhyPcs + kPcsPowerDown) | 1U);
++  phyWriteTable (phy, kPhySerdes, kPhyTableSerdes,
++                 sizeof (kPhyTableSerdes) / sizeof (kPhyTableSerdes[0]));
++  phyWriteTable (phy, kPhyTx, kPhyTableTx, sizeof (kPhyTableTx) / sizeof (kPhyTableTx[0]));
++  phyWriteTable (phy, kPhyTx + 0x800, kPhyTableTx, sizeof (kPhyTableTx) / sizeof (kPhyTableTx[0]));
++  phyWriteTable (phy, kPhyRx, kPhyTableRx, sizeof (kPhyTableRx) / sizeof (kPhyTableRx[0]));
++  phyWriteTable (phy, kPhyRx + 0x800, kPhyTableRx, sizeof (kPhyTableRx) / sizeof (kPhyTableRx[0]));
++  phyWriteTable (phy, kPhyPcs, kPhyTablePcs, sizeof (kPhyTablePcs) / sizeof (kPhyTablePcs[0]));
++  // The tablet negotiates HS-G4, so apply that overlay the way the Linux
++  // driver does for its gear overlay tables.
++  phyWriteTable (phy, kPhySerdes, kPhyTableSerdesG4,
++                 sizeof (kPhyTableSerdesG4) / sizeof (kPhyTableSerdesG4[0]));
++  phyWriteTable (phy, kPhyTx, kPhyTableTxG4, sizeof (kPhyTableTxG4) / sizeof (kPhyTableTxG4[0]));
++  phyWriteTable (phy, kPhyTx + 0x800, kPhyTableTxG4, sizeof (kPhyTableTxG4) / sizeof (kPhyTableTxG4[0]));
++  phyWriteTable (phy, kPhyRx, kPhyTableRxG4, sizeof (kPhyTableRxG4) / sizeof (kPhyTableRxG4[0]));
++  phyWriteTable (phy, kPhyRx + 0x800, kPhyTableRxG4, sizeof (kPhyTableRxG4) / sizeof (kPhyTableRxG4[0]));
++  phyWriteTable (phy, kPhyPcs, kPhyTablePcsG4, sizeof (kPhyTablePcsG4) / sizeof (kPhyTablePcsG4[0]));
++  write32 (phy, kPhyPcs + kPcsSwReset, read32 (phy, kPhyPcs + kPcsSwReset) & ~1U);
++  write32 (phy, kPhyPcs + kPcsStart, read32 (phy, kPhyPcs + kPcsStart) | 1U);
++  bool ready = false;
++  for (unsigned spin = 0; spin < 1000; ++spin) {
++    if (read32 (phy, kPhyPcs + kPcsReady) & kPcsReadyBit) { ready = true; break; }
++    IODelay (100);
++  }
++  IOLog ("PONG_UFS: PHY bring-up ready=%u ready=%08x->%08x serdes=%08x tx=%08x rx=%08x\n",
++         ready, readyBefore, read32 (phy, kPhyPcs + kPcsReady),
++         read32 (phy, kPhySerdes), read32 (phy, kPhyTx), read32 (phy, kPhyRx));
++  return ready;
++}
++
++// Same order the working firmware driver uses: pre-link lane selection, link
++// startup, then gear/termination/RXTX power mode.
++static uint32_t uicBringUp (uintptr_t host)
++{
++  uint32_t lanes = 0, gear = 0;
++  uint32_t result = uicCommand (host, kDmeGet, kMibAvailableTxLanes, 0, 0, &lanes);
++  IOLog ("PONG_UFS: UIC available lanes result=%08x lanes=%08x\n", result, lanes);
++  if (!lanes || lanes > 0xfU) lanes = 0xfU;
++  uint32_t tx = uicCommand (host, kDmeSet, kMibActiveTxLanes, 0, lanes, nullptr);
++  uint32_t rx = uicCommand (host, kDmeSet, kMibActiveRxLanes, 0, lanes, nullptr);
++  IOLog ("PONG_UFS: UIC active lanes tx=%08x rx=%08x\n", tx, rx);
++  result = uicCommand (host, kDmeLinkStartup, 0, 0, 0, nullptr);
++  if (result) {
++    uint32_t reset = uicCommand (host, kDmeReset, 0, 0, 0, nullptr);
++    IOLog ("PONG_UFS: UIC DME_RESET result=%08x; retrying link startup\n", reset);
++    IODelay (1000);
++    result = uicCommand (host, kDmeLinkStartup, 0, 0, 0, nullptr);
++  }
++  if (result) return result;
++  uint32_t queried = uicCommand (host, kDmeGet, kMibMaxRxGear, 0, 0, &gear);
++  IOLog ("PONG_UFS: UIC max gear result=%08x gear=%08x\n", queried, gear);
++  if (!gear || gear > 4U) gear = 4U;
++  uint32_t setGear = uicCommand (host, kDmeSet, kMibRxGear, 0, gear, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibTxGear, 0, gear, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibActiveRxLanes, 0, lanes, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibActiveTxLanes, 0, lanes, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibRxTermination, 0, 1, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibTxTermination, 0, 1, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibHsSeries, 0, kUfsHsSeries, nullptr);
++  uint32_t power = uicCommand (host, kDmeSet, kMibPowerMode, 0, kUfsRxtxPowerMode, nullptr);
++  IOLog ("PONG_UFS: UIC gear/lanes set=%08x power=%08x hcs=%08x\n",
++         setGear, power, read32 (host, 0x30));
++  return power;
++}
++
+ static bool contains (const char *data, size_t length, const char *needle)
+ {
+   size_t wanted = strlen (needle);
+@@ -339,6 +445,7 @@ static bool clockBusesRunning ()
+ // registry properties all describe the same moment.
+ struct UfsHost {
+   uintptr_t base;
++  uintptr_t phy = 0;
+   uint32_t capability;
+   uint32_t version;
+   uint32_t interruptStatus;
+@@ -393,9 +500,9 @@ struct UfsHost {
+         write32 (base, offset, read32 (base, offset));
+       write32 (base, kInterruptStatus, kIsUicError);
+     }
+-    for (unsigned spin = 0; spin < 1000 && !(read32 (base, 0x30) & kHcsUicReady); ++spin)
+-      IODelay (10);
+-    uint32_t result = uicLinkStartup (base);
++    if (!phyBringUp (phy))
++      IOLog ("PONG_UFS: PHY did not report ready; still attempting the link\n");
++    uint32_t result = uicBringUp (base);
+     for (unsigned spin = 0; spin < 1000 && !(read32 (base, 0x30) & kHcsDevicePresent); ++spin)
+       IODelay (10);
+     IOLog ("PONG_UFS: DME_LINKSTARTUP(%s) result=%08x hcs=%08x dl=%08x->%08x ue=%08x\n",
+@@ -569,7 +676,8 @@ bool NativeUfs::start (IOService *provider)
+     native_ufs_status = 3;
+     host.sample ();
+     host.enableController ();
+-    probePhy (mapPhysical (kUfsPhyPage, kUfsPhyBytes, phyMap));
++    host.phy = mapPhysical (kUfsPhyPage, kUfsPhyBytes, phyMap);
++    probePhy (host.phy);
+     host.requestLink ();
+     host.publish ();
+     native_ufs_status = 4;
+diff --git a/drivers/NativeUfs/PongUfsPhyTables.h b/drivers/NativeUfs/PongUfsPhyTables.h
+new file mode 100644
+index 0000000..242c9b2
+--- /dev/null
++++ b/drivers/NativeUfs/PongUfsPhyTables.h
+@@ -0,0 +1,70 @@
++// Generated from Linux drivers/phy/qualcomm/phy-qcom-qmp-ufs.c (QMP UFS PHY v6,
++// SM8475 tables) by docs/make-phy-tables.py. Offsets are block-relative.
++struct PongPhyReg { uint32_t offset; uint32_t value; };
++
++static const PongPhyReg kPhyTableSerdes[] = {
++  { 0x110, 0xd9 },
++  { 0x174, 0x16 },
++  { 0x03c, 0x11 },
++  { 0x09c, 0x00 },
++  { 0x120, 0x01 },
++  { 0x148, 0x00 },
++  { 0x088, 0x82 },
++  { 0x074, 0x18 },
++  { 0x078, 0x18 },
++  { 0x080, 0xff },
++  { 0x084, 0x0c },
++};
++
++static const PongPhyReg kPhyTableTx[] = {
++  { 0x07c, 0x05 },
++  { 0x030, 0x07 },
++};
++
++static const PongPhyReg kPhyTableRx[] = {
++  { 0x0d4, 0x0c },
++  { 0x208, 0xc2 },
++  { 0x20c, 0xc2 },
++  { 0x214, 0x1a },
++  { 0x220, 0x60 },
++  { 0x238, 0x9e },
++  { 0x244, 0x60 },
++  { 0x25c, 0x9e },
++  { 0x260, 0x0e },
++  { 0x264, 0x36 },
++  { 0x270, 0x02 },
++};
++
++static const PongPhyReg kPhyTablePcs[] = {
++  { 0x18c, 0x69 },
++  { 0x030, 0x0f },
++  { 0x1f4, 0x43 },
++  { 0x1fc, 0x02 },
++};
++
++static const PongPhyReg kPhyTableSerdesG4[] = {
++  { 0x140, 0x04 },
++  { 0x0f4, 0x0f },
++  { 0x070, 0x14 },
++  { 0x028, 0x98 },
++  { 0x010, 0x14 },
++  { 0x014, 0x18 },
++  { 0x018, 0x18 },
++  { 0x020, 0x32 },
++  { 0x024, 0x0f },
++};
++
++static const PongPhyReg kPhyTableTxG4[] = {
++  { 0x108, 0x4c },
++};
++
++static const PongPhyReg kPhyTableRxG4[] = {
++  { 0x178, 0x0e },
++};
++
++static const PongPhyReg kPhyTablePcsG4[] = {
++  { 0x02c, 0x0b },
++  { 0x074, 0x04 },
++  { 0x0bc, 0x04 },
++};
++
+diff --git a/drivers/NativeUfs/PongUfsTransport.cpp b/drivers/NativeUfs/PongUfsTransport.cpp
+index cadba81..9897a41 100644
+--- a/drivers/NativeUfs/PongUfsTransport.cpp
++++ b/drivers/NativeUfs/PongUfsTransport.cpp
+@@ -132,6 +132,7 @@ static bool transportFailure(const char *why) {
+   char text[2400];
+   formatUfsRootDiagnostics(text, sizeof(text), gRootDiagnostic, why, "PONG_UFS TRANSPORT");
+   IOLog("%s\nPONG_UFS: no media published; continue boot\n", text);
++  panic("PONG_UFS: transport failed (%s); diagnostics above", why);
+   PongProbeRecord(4, "ufs-transport", PongProbeFail, why, gRootDiagnostic.result);
+   snprintf(text, sizeof(text), "stage=%s op=%x ocs=%x scsi=%x protocol=%u", gRootDiagnostic.stage,
+            gRootDiagnostic.opcode, gRootDiagnostic.ocs, gRootDiagnostic.scsi, gRootDiagnostic.protocol);
+@@ -181,34 +182,44 @@ static bool hostBringUp() {
+     lease.held = pong_smmu_lease_lock();
+     if (!lease.held) return transportFailure("Apps SMMU lease unavailable");
+   }
+-  // Keep the loader SMMU handover mapping exactly as it was left. The
+-  // loader itself reads the whole GPT with SID e0 still bound to the
+-  // firmware bank and the queue in physical passthrough. Re-pointing SID
+-  // e0 at a freshly programmed bank is the one thing that working path
+-  // never does, so leave the global SMMU table untouched and rely on the
+-  // mapping firmware established.
+-  IOLog ("PONG_UFS: SMMU handover mapping left untouched (no reprogram)\n");
+-  // Read-only diagnostic: the previous SMMU snapshot was dead code
+-  // (gHost.smmu/cb were never assigned), so SMMU was never truly ruled out.
+-  // Report SID e0 routing: type 2 = physical passthrough, type 0 = translation.
+-  // Never write SMR/S2CR here; shim reads the GPT under the handover map.
+-  gHost.smmu = mapPhys(0x15000000, 0x200000, gHost.smmuMap);
+-  if (gHost.smmu) {
+-    uint32_t idr0 = read32(gHost.smmu, 0x20), idr1 = read32(gHost.smmu, 0x24);
+-    unsigned groups = (idr0 & 255) < 120 ? (idr0 & 255) : 120;
+-    unsigned pages = 1U << (((idr1 >> 28) & 7) + 1);
+-    IOLog("PONG_UFS: SMMU diag idr0=%08x idr1=%08x groups=%u pages=%u\n",
+-          idr0, idr1, groups, pages);
+-    for (unsigned i = 0; i < groups; ++i) {
+-      uint32_t smr = read32(gHost.smmu, 0x800 + 4 * i);
+-      if (!(smr & 0x80000000U)) continue;
+-      uint32_t mask = (smr >> 16) & 0x7fff;
+-      if (((smr ^ 0xe0) & 0xffff & ~mask) != 0) continue;
+-      uint32_t s2cr = read32(gHost.smmu, 0xc00 + 4 * i);
+-      unsigned type = (s2cr >> 16) & 3, bank = s2cr & 255;
+-      IOLog("PONG_UFS: SID e0 slot=%u smr=%08x s2cr=%08x type=%u bank=%u\n",
+-            i, smr, s2cr, type, bank);
+-      gHost.cb = gHost.smmu + (pages + bank) * 4096;
++  // liuqin: the kernel owns its own DMA buffer (UTRL / UCD / data), while the
++  // loader's SMMU handover mapping was only ever used for the loader's buffers.
++  // Program SID e0 for this buffer through the planner this repository already
++  // carries (the same one the ShengUfs port used to read the GPT on this tablet):
++  // an exact firmware mapping for the UFS SID is migrated to an owned bank and
++  // set to a VA64 bypass covering the descriptor buffer. Anything ambiguous is
++  // refused, and then the handover mapping stays untouched as before.
++  gHost.smmu = mapPhys(0x15000000, 0x100000, gHost.smmuMap);
++  if (!gHost.smmu) {
++    IOLog("PONG_UFS: SMMU map failed; leaving the handover mapping untouched\n");
++  } else {
++    auto smmuRead = [](unsigned offset) { return read32(gHost.smmu, offset); };
++    auto smmuWrite = [](unsigned offset, uint32_t value) {
++      write32(gHost.smmu, offset, value);
++      __asm__ volatile("dsb sy" ::: "memory");
++    };
++    UfsSmmuPlan plan = planUfsSmmu(0xe0, gHost.phys, kDmaBytes, smmuRead, 78, 120);
++    gRootDiagnostic.smmuId1 = smmuRead(0x24);
++    gRootDiagnostic.smmuId2 = smmuRead(0x28);
++    gRootDiagnostic.smmuSlot = plan.slot;
++    if (plan.error) {
++      IOLog("PONG_UFS: SMMU planner refused (%s); handover mapping untouched\n", plan.error);
++    } else {
++      const char *failure = configureUfsSmmu(plan, 0xe0, smmuRead, smmuWrite);
++      if (failure) {
++        IOLog("PONG_UFS: SMMU bypass configure failed (%s)\n", failure);
++      } else {
++        gHost.cb = gHost.smmu + (plan.pages + plan.bank) * 4096;
++        gRootDiagnostic.smr = smmuRead(0x800 + 4 * plan.slot);
++        gRootDiagnostic.s2cr = smmuRead(0xc00 + 4 * plan.slot);
++        gRootDiagnostic.cbar = smmuRead(0x1000 + 4 * plan.bank);
++        gRootDiagnostic.sctlr = read32(gHost.cb, 0);
++        gRootDiagnostic.cba2r = smmuRead(0x1800 + 4 * plan.bank);
++        IOLog("PONG_UFS: SID e0 bypass for the kernel DMA buffer: slot=%u bank=%u "
++              "smr=%08x s2cr=%08x cbar=%08x sctlr=%08x\n",
++              plan.slot, plan.bank, gRootDiagnostic.smr, gRootDiagnostic.s2cr,
++              gRootDiagnostic.cbar, gRootDiagnostic.sctlr);
++      }
+     }
+   }
+   } // Release before queue commands or storage readiness notifications.
+@@ -489,6 +500,7 @@ bool PongUfsBlock::start(IOService *provider) {
+     // UFS controller. Do not invalidate already published OS/SystemOS disks.
+     IOLog("PONG_UFS: %s window has no supported filesystem header base=%llx bytes=%llx; media not published\n",
+           window.name, window.baseByte, window.size);
++    panic("PONG_UFS: %s window has no supported filesystem header", window.name);
+     char detail[96];
+     snprintf(detail, sizeof(detail), "%s filesystem header invalid", window.name);
+     PongProbeRecord(4, "ufs-transport", PongProbeFail, detail, window.baseByte);
