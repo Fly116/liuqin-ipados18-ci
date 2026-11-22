@@ -291,6 +291,12 @@ jobs:
             --local-module "soc:sm8475=$GITHUB_WORKSPACE/device/migration/format2/soc-seed" \
             "${args[@]}" 2>&1 | tee ../kernel-build.log
 
+      - name: ccache stats
+        if: always()
+        run: |
+          ccache --show-stats || true
+          du -sh "$CCACHE_DIR" 2>/dev/null || true
+
       - name: collect products
         if: always()
         run: |
