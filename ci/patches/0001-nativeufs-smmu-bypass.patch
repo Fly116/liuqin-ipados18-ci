@@ -1,16 +1,8 @@
 diff --git a/drivers/NativeUfs/PongUfsTransport.cpp b/drivers/NativeUfs/PongUfsTransport.cpp
-index cadba81..90faf16 100644
+index cadba81..5316e7e 100644
 --- a/drivers/NativeUfs/PongUfsTransport.cpp
 +++ b/drivers/NativeUfs/PongUfsTransport.cpp
-@@ -113,6 +113,7 @@ static void hostWrite(unsigned offset, uint32_t value) { write32(gHost.hc, offse
- #include "RootQueue.h"
- #include "RootCommands.h"
- #include "RootLayout.h"
-+#include "SmmuTakeover.h"
- 
- static bool transportFailure(const char *why) {
-   gHost.ready = false;
-@@ -181,34 +182,44 @@ static bool hostBringUp() {
+@@ -181,34 +181,44 @@ static bool hostBringUp() {
      lease.held = pong_smmu_lease_lock();
      if (!lease.held) return transportFailure("Apps SMMU lease unavailable");
    }
