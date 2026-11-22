@@ -163,7 +163,7 @@ jobs:
           fi
           for patch in "${patches[@]}"; do
             echo "applying ${patch}"
-            git -C device apply -p1 --whitespace=nowarn "${patch}"
+            git -C device apply -p1 --whitespace=nowarn "${PWD}/${patch}"
           done
 
       - name: check the patch set
