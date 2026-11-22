@@ -1,11 +1,12 @@
 diff --git a/drivers/NativeUfs/NativeUfs.cpp b/drivers/NativeUfs/NativeUfs.cpp
-index 2bbc068..7cb217c 100644
+index 2bbc068..c7efd60 100644
 --- a/drivers/NativeUfs/NativeUfs.cpp
 +++ b/drivers/NativeUfs/NativeUfs.cpp
-@@ -87,7 +87,26 @@ constexpr unsigned kUicArg1 = 0x94;
+@@ -87,14 +87,33 @@ constexpr unsigned kUicArg1 = 0x94;
  constexpr unsigned kUicArg2 = 0x98;
  constexpr unsigned kUicArg3 = 0x9c;
  constexpr uint32_t kUicDone = 1U << 10;
++constexpr uint32_t kHcsUicReady = 1U << 3;     // HCS.UCRDY: UIC accepts a command
 +// UIC opcodes and MIB attributes, from SamsungPkg UfsHostBridge.h and the vendor
 +// UfsDxe sequence that reads the GPT on this tablet:
 +//   DME_GET/DME_SET take UIC_ARG_MIB(attribute) = attribute << 16 in ARG_1;
@@ -29,6 +30,13 @@ index 2bbc068..7cb217c 100644
  
  // Interrupt status bit2 is UIC error; HCS bit3 says the UIC accepts a command.
  // A loader that tears UFS down leaves the UIC error latched while HCS keeps
+ // reporting the device present, because nobody clears either on the way out.
+ constexpr uint32_t kIsUicError = 1U << 2;
+ constexpr uint32_t kHcsDevicePresent = 1U << 0;
+-constexpr uint32_t kHcsUicReady = 1U << 3;
+ constexpr unsigned kUicErrorDataLink = 0x3c;
+ constexpr unsigned kInterruptStatus = 0x20;
+ 
 @@ -115,16 +134,22 @@ static void write32 (uintptr_t base, unsigned offset, uint32_t value)
    *reinterpret_cast<volatile uint32_t *> (base + offset) = value;
  }
@@ -42,7 +50,7 @@ index 2bbc068..7cb217c 100644
 -  write32 (host, kUicArg1, 0);
 -  write32 (host, kUicArg2, 0);
 -  write32 (host, kUicArg3, 0);
-+  for (unsigned spin = 0; spin < 1000 && !(read32 (host, 0x30) & 8U); ++spin)  // HCS.UCRDY
++  for (unsigned spin = 0; spin < 1000 && !(read32 (host, 0x30) & kHcsUicReady); ++spin)
 +    IODelay (10);
 +  write32 (host, kUicArg1, arg1);
 +  write32 (host, kUicArg2, arg2);
