@@ -1,8 +1,19 @@
 diff --git a/drivers/NativeUfs/PongUfsTransport.cpp b/drivers/NativeUfs/PongUfsTransport.cpp
-index cadba81..29196f3 100644
+index cadba81..6530449 100644
 --- a/drivers/NativeUfs/PongUfsTransport.cpp
 +++ b/drivers/NativeUfs/PongUfsTransport.cpp
-@@ -154,18 +154,23 @@ static bool hostBringUp() {
+@@ -46,6 +46,10 @@ struct UfsHost {
+   bool writable = false;
+ };
+ static UfsHost gHost;
++// The kernel has no support for function-local statics with non-trivial
++// constructors, so the firmware request-list mapping lives here as a raw
++// retained map for the lifetime of the driver.
++static IOMemoryMap *gFirmwareListMap = nullptr;
+ static uint32_t gWifiUfsReady;
+ static bool gTransportAttempted;
+ enum : uint64_t {
+@@ -154,18 +158,29 @@ static bool hostBringUp() {
    gRootDiagnostic.cap = read32(gHost.hc, 0);
    gRootDiagnostic.version = read32(gHost.hc, 8);
    recordTransport(kIOReturnNotReady, 15);
@@ -12,14 +23,20 @@ index cadba81..29196f3 100644
 +  // liuqin: the controller only reliably reaches the request-list region the loader
 +  // itself allocated. ShengUfs on this tablet was reset by a kernel allocation at
 +  // 0xf080f000 on the first command and then worked from the firmware's UTRL page
-+  // (16 KiB, zeroed by the loader). Reuse that page and keep the mapping for the
-+  // lifetime of the driver; the SMMU handover mapping already covers it.
++  // (16 KiB, zeroed by the loader). Reuse that page; the SMMU handover mapping
++  // already covers it.
 +  gRootDiagnostic.stage = "firmware request list";
 +  uint64_t firmwareList = (uint64_t(read32(gHost.hc, 0x54)) << 32) | read32(gHost.hc, 0x50);
 +  if (!firmwareList || (firmwareList & 0xfff)) return transportFailure("firmware request list base");
-+  static OSSharedPtr<IOMemoryMap> firmwareListMap;
-+  gHost.virt = reinterpret_cast<uint8_t *>(mapPhys(firmwareList, kDmaBytes, firmwareListMap));
++  if (!gFirmwareListMap) {
++    IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(
++        firmwareList, kDmaBytes, kIODirectionInOut);
++    if (!memory) return transportFailure("firmware request list descriptor");
++    gFirmwareListMap = memory->map(kIOMapAnywhere | kIOMapInhibitCache);
++    memory->release();
++  }
 +  gHost.phys = firmwareList;
++  gHost.virt = gFirmwareListMap ? reinterpret_cast<uint8_t *>(gFirmwareListMap->getVirtualAddress()) : nullptr;
    gHost.lock = IOLockAlloc();
 -  if (!gHost.dma || !gHost.lock) return transportFailure("DMA allocation");
 -  gHost.virt = static_cast<uint8_t *>(gHost.dma->getBytesNoCopy());
