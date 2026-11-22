@@ -39,6 +39,7 @@ env:
   HOMEBREW_NO_INSTALL_CLEANUP: '1'
   LLVM_KEG: /usr/local/opt/llvm@18
   LLD_KEG: /usr/local/opt/lld
+  CCACHE_DIR: /Users/runner/ccache
 
 jobs:
   kernel:
@@ -105,6 +106,49 @@ jobs:
             command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
           done
           [ "$ok" = 1 ]
+
+      - name: ccache cache
+        id: ccache-restore
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ env.UNIXNU_REF }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.UNIXNU_REF }}-
+
+      - name: ccache toolchain
+        run: |
+          set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+          command -v ccache >/dev/null || brew install ccache
+          # The kit recipe resolves clang itself unless CC has a non-default origin,
+          # and a two-word CC breaks the mig rules. A one-file shim keeps CC a single
+          # absolute path in front of ccache while still looking like clang.
+          ccache_bin="$(command -v ccache)"
+          real_cc="$(/usr/bin/xcrun -find clang)"
+          real_cxx="$(/usr/bin/xcrun -find clang++)"
+          wrap="${RUNNER_TEMP}/ccache-wrap"
+          mkdir -p "$wrap"
+          for pair in "clang:${real_cc}" "clang++:${real_cxx}" "cc:${real_cc}" "c++:${real_cxx}"; do
+            name="${pair%%:*}"
+            target="${pair#*:}"
+            printf '#!/bin/sh\nexec %s %s "$@"\n' "${ccache_bin}" "${target}" > "${wrap}/${name}"
+            chmod +x "${wrap}/${name}"
+          done
+          {
+            printf 'XNU_CC=%s/clang\n' "${wrap}"
+            printf 'XNU_CXX=%s/clang++\n' "${wrap}"
+            printf 'CCACHE_BASEDIR=%s\n' "$GITHUB_WORKSPACE"
+            printf 'CCACHE_NOHASHDIR=true\n'
+            printf 'CCACHE_COMPILERCHECK=content\n'
+            printf 'CCACHE_SLOPPINESS=time_macros,include_file_ctime,include_file_mtime,file_stat_matches\n'
+            printf 'CCACHE_MAXSIZE=4G\n'
+            printf 'CCACHE_UMASK=002\n'
+          } >> "$GITHUB_ENV"
+          printf 'int main(void) { return 0; }\n' > "${RUNNER_TEMP}/ccache-probe.c"
+          "${wrap}/clang" -c "${RUNNER_TEMP}/ccache-probe.c" -o "${RUNNER_TEMP}/ccache-probe.o"
+          echo "ccache $(${ccache_bin} --version | head -1)"
+          "${ccache_bin}" --show-stats | head -4
 
       - name: platform seed
         env:
