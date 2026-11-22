@@ -160,7 +160,7 @@ index cadba81..ee805ba 100644
      snprintf(detail, sizeof(detail), "%s filesystem header invalid", window.name);
      PongProbeRecord(4, "ufs-transport", PongProbeFail, detail, window.baseByte);
 diff --git a/drivers/NativeUfs/RootCommands.h b/drivers/NativeUfs/RootCommands.h
-index 02a9012..29578aa 100644
+index 02a9012..3cdf197 100644
 --- a/drivers/NativeUfs/RootCommands.h
 +++ b/drivers/NativeUfs/RootCommands.h
 @@ -54,9 +54,9 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
@@ -193,24 +193,6 @@ index 02a9012..29578aa 100644
    for (unsigned index = 0; index < (kPrdtOffset + 16) / 4; index++) {
      words[index] = 0;
    }
-@@ -209,7 +209,7 @@ static IOReturn hostScsiDir (uint8_t lun, const uint8_t *cdb, unsigned cdbLength
-                   dataBytes == (((unsigned(cdb[7]) << 8) | cdb[8]) * 4096U));
-   if (!allowed) return kIOReturnUnsupported;
-   if (!hostClearUcd ()) return kIOReturnNotReady;
--  uint8_t *ucd = gHost.virt + kUcdOffset;
-+  volatile uint8_t *ucd = gHost.virt + kUcdOffset;
-   ucd[0] = 0x01;                      // COMMAND UPIU
-   ucd[1] = direction == 2 ? 0x40 : direction == 1 ? 0x20 : 0x00;   // R: data in, W: data out
-   ucd[2] = lun;
-@@ -255,7 +255,7 @@ static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
- {
-   if (!value || (opcode != 3 && opcode != 5)) return kIOReturnBadArgument;
-   if (!hostClearUcd ()) return kIOReturnNotReady;
--  uint8_t *ucd = gHost.virt + kUcdOffset;
-+  volatile uint8_t *ucd = gHost.virt + kUcdOffset;
-   ucd[0] = 0x16;                      // QUERY REQUEST
-   ucd[3] = 1;
-   ucd[5] = 0x01;                      // standard read request (header dword 1, byte 1)
 diff --git a/drivers/NativeUfs/RootTransportLayout.h b/drivers/NativeUfs/RootTransportLayout.h
 index f6c926e..3b4c0f1 100644
 --- a/drivers/NativeUfs/RootTransportLayout.h
