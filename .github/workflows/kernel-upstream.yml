@@ -23,6 +23,10 @@ on:
         description: 'Prelink the extracted 22H374 kernelcache into kernel.macho'
         type: boolean
         default: true
+      patch_dir:
+        description: 'Directory under ci/ holding the patch set to apply'
+        required: true
+        default: 'ci/patches'
 
 permissions:
   contents: read
@@ -153,10 +157,12 @@ jobs:
           echo "PONG_SHENG_ROOT=$root"
 
       - name: apply local driver patches
+        env:
+          PATCH_DIR: ${{ inputs.patch_dir || 'ci/patches' }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          patches=(ci-repo/ci/patches/[0-9][0-9][0-9][0-9]-*.patch)
+          patches=(ci-repo/"${PATCH_DIR}"/[0-9][0-9][0-9][0-9]-*.patch)
           if [ ${#patches[@]} -eq 0 ]; then
             echo "no ci/patches to apply"
             exit 0
