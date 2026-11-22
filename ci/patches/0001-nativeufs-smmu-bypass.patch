@@ -1,0 +1,85 @@
+diff --git a/drivers/NativeUfs/PongUfsTransport.cpp b/drivers/NativeUfs/PongUfsTransport.cpp
+index cadba81..90faf16 100644
+--- a/drivers/NativeUfs/PongUfsTransport.cpp
++++ b/drivers/NativeUfs/PongUfsTransport.cpp
+@@ -113,6 +113,7 @@ static void hostWrite(unsigned offset, uint32_t value) { write32(gHost.hc, offse
+ #include "RootQueue.h"
+ #include "RootCommands.h"
+ #include "RootLayout.h"
++#include "SmmuTakeover.h"
+ 
+ static bool transportFailure(const char *why) {
+   gHost.ready = false;
+@@ -181,34 +182,44 @@ static bool hostBringUp() {
+     lease.held = pong_smmu_lease_lock();
+     if (!lease.held) return transportFailure("Apps SMMU lease unavailable");
+   }
+-  // Keep the loader SMMU handover mapping exactly as it was left. The
+-  // loader itself reads the whole GPT with SID e0 still bound to the
+-  // firmware bank and the queue in physical passthrough. Re-pointing SID
+-  // e0 at a freshly programmed bank is the one thing that working path
+-  // never does, so leave the global SMMU table untouched and rely on the
+-  // mapping firmware established.
+-  IOLog ("PONG_UFS: SMMU handover mapping left untouched (no reprogram)\n");
+-  // Read-only diagnostic: the previous SMMU snapshot was dead code
+-  // (gHost.smmu/cb were never assigned), so SMMU was never truly ruled out.
+-  // Report SID e0 routing: type 2 = physical passthrough, type 0 = translation.
+-  // Never write SMR/S2CR here; shim reads the GPT under the handover map.
+-  gHost.smmu = mapPhys(0x15000000, 0x200000, gHost.smmuMap);
+-  if (gHost.smmu) {
+-    uint32_t idr0 = read32(gHost.smmu, 0x20), idr1 = read32(gHost.smmu, 0x24);
+-    unsigned groups = (idr0 & 255) < 120 ? (idr0 & 255) : 120;
+-    unsigned pages = 1U << (((idr1 >> 28) & 7) + 1);
+-    IOLog("PONG_UFS: SMMU diag idr0=%08x idr1=%08x groups=%u pages=%u\n",
+-          idr0, idr1, groups, pages);
+-    for (unsigned i = 0; i < groups; ++i) {
+-      uint32_t smr = read32(gHost.smmu, 0x800 + 4 * i);
+-      if (!(smr & 0x80000000U)) continue;
+-      uint32_t mask = (smr >> 16) & 0x7fff;
+-      if (((smr ^ 0xe0) & 0xffff & ~mask) != 0) continue;
+-      uint32_t s2cr = read32(gHost.smmu, 0xc00 + 4 * i);
+-      unsigned type = (s2cr >> 16) & 3, bank = s2cr & 255;
+-      IOLog("PONG_UFS: SID e0 slot=%u smr=%08x s2cr=%08x type=%u bank=%u\n",
+-            i, smr, s2cr, type, bank);
+-      gHost.cb = gHost.smmu + (pages + bank) * 4096;
++  // liuqin: the kernel owns its own DMA buffer (UTRL / UCD / data), while the
++  // loader's SMMU handover mapping was only ever used for the loader's buffers.
++  // Program SID e0 for this buffer through the planner this repository already
++  // carries (the same one the ShengUfs port used to read the GPT on this tablet):
++  // an exact firmware mapping for the UFS SID is migrated to an owned bank and
++  // set to a VA64 bypass covering the descriptor buffer. Anything ambiguous is
++  // refused, and then the handover mapping stays untouched as before.
++  gHost.smmu = mapPhys(0x15000000, 0x100000, gHost.smmuMap);
++  if (!gHost.smmu) {
++    IOLog("PONG_UFS: SMMU map failed; leaving the handover mapping untouched\n");
++  } else {
++    auto smmuRead = [](unsigned offset) { return read32(gHost.smmu, offset); };
++    auto smmuWrite = [](unsigned offset, uint32_t value) {
++      write32(gHost.smmu, offset, value);
++      __asm__ volatile("dsb sy" ::: "memory");
++    };
++    UfsSmmuPlan plan = planUfsSmmu(0xe0, gHost.phys, kDmaBytes, smmuRead, 78, 120);
++    gRootDiagnostic.smmuId1 = smmuRead(0x24);
++    gRootDiagnostic.smmuId2 = smmuRead(0x28);
++    gRootDiagnostic.smmuSlot = plan.slot;
++    if (plan.error) {
++      IOLog("PONG_UFS: SMMU planner refused (%s); handover mapping untouched\n", plan.error);
++    } else {
++      const char *failure = configureUfsSmmu(plan, 0xe0, smmuRead, smmuWrite);
++      if (failure) {
++        IOLog("PONG_UFS: SMMU bypass configure failed (%s)\n", failure);
++      } else {
++        gHost.cb = gHost.smmu + (plan.pages + plan.bank) * 4096;
++        gRootDiagnostic.smr = smmuRead(0x800 + 4 * plan.slot);
++        gRootDiagnostic.s2cr = smmuRead(0xc00 + 4 * plan.slot);
++        gRootDiagnostic.cbar = smmuRead(0x1000 + 4 * plan.bank);
++        gRootDiagnostic.sctlr = read32(gHost.cb, 0);
++        gRootDiagnostic.cba2r = smmuRead(0x1800 + 4 * plan.bank);
++        IOLog("PONG_UFS: SID e0 bypass for the kernel DMA buffer: slot=%u bank=%u "
++              "smr=%08x s2cr=%08x cbar=%08x sctlr=%08x\n",
++              plan.slot, plan.bank, gRootDiagnostic.smr, gRootDiagnostic.s2cr,
++              gRootDiagnostic.cbar, gRootDiagnostic.sctlr);
++      }
+     }
+   }
+   } // Release before queue commands or storage readiness notifications.
