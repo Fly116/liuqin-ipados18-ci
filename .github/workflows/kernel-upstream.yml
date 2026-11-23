@@ -200,6 +200,24 @@ jobs:
           echo "PONG_SHENG_ROOT=$root" >> "$GITHUB_ENV"
           echo "PONG_SHENG_ROOT=$root"
 
+      - name: systemos union
+        run: |
+          set -euo pipefail
+          # dyld needs the SystemOS volume unioned over the OS root before
+          # launchd runs; the bring-up step above rewrites this file, so the
+          # knob is set here rather than by a patch.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("device/configs/liuqin_ipados18_defconfig")
+          text = path.read_text()
+          old = "CONFIG_XNU_OWNER_UNION_SYSTEMOS=n"
+          if old not in text:
+              raise SystemExit(old + " is not in " + str(path))
+          path.write_text(text.replace(old, "CONFIG_XNU_OWNER_UNION_SYSTEMOS=y"))
+          print("SystemOS union enabled for dyld")
+          PY
+          grep -n CONFIG_XNU_OWNER_UNION_SYSTEMOS device/configs/liuqin_ipados18_defconfig
+
       - name: apply local driver patches
         env:
           PATCH_DIR: ${{ inputs.patch_dir || 'ci/patches' }}
