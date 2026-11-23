@@ -1,0 +1,316 @@
+diff --git a/drivers/NativeUfs/NativeUfs.cpp b/drivers/NativeUfs/NativeUfs.cpp
+index 2bbc068..a306e2f 100644
+--- a/drivers/NativeUfs/NativeUfs.cpp
++++ b/drivers/NativeUfs/NativeUfs.cpp
+@@ -169,6 +169,78 @@ static uintptr_t mapPhysical (uint64_t physical, uint64_t bytes,
+   return mapping ? static_cast<uintptr_t> (mapping->getVirtualAddress ()) : 0;
+ }
+ 
++// Power every rail the liuqin UFS board data names. Nothing in a UFS-only boot
++// votes them; the loader powered them to read the boot image and dropped them
++// before the handover, which is why the QMP PHY registers read back zero (v119-
++// v124) and the first NOP came back with IS.UE set (v131).
++//   PHY   vdda-phy = PM8350B L5 (ldob5), vdda-pll = PM8350C L10 (ldoc10)
++//   device vcc = PM8350B L7 (ldob7), vccq + vddp-ref-clk = PM8350B L9 (ldob9)
++//   PHY GDSC parent supply = the CX level rail (cx.lvl)
++// Same byte layout as PongUsbPhy: mode at resource+8, voltage mV at resource+0,
++// enable at resource+4; level rails take the highest ARC index.
++extern "C" bool pong_rpmh_vote (uint32_t address, uint32_t value);
++extern "C" int qcom_cmd_db_find (const unsigned char *db, unsigned long bytes,
++                                 const char *name, void *out);
++extern "C" int qcom_rpmh_level_index (const void *resource, uint32_t level, uint32_t *index);
++struct QcomRpmhResourceLocal {
++  uint32_t address;
++  uint16_t levels[16];
++  unsigned level_count;
++};
++
++static bool ufsRailVote ()
++{
++  OSSharedPtr<IOMemoryMap> map;
++  uintptr_t db = mapPhysical (0x80860000, 0x20000, map);
++  if (!db) {
++    IOLog ("PONG_UFS: cmd-db map failed; UFS rails not voted\n");
++    return false;
++  }
++  static unsigned char copy[0x20000];
++  memcpy (copy, reinterpret_cast<const void *>(db), sizeof copy);
++  bool ok = true;
++  struct Rail { const char *name; uint32_t mv; };
++  const Rail rails[] = {{"ldob5", 880}, {"ldoc10", 1200}, {"ldob7", 2504}, {"ldob9", 1200}};
++  for (unsigned index = 0; index < sizeof rails / sizeof rails[0]; ++index) {
++    QcomRpmhResourceLocal resource = {};
++    if (qcom_cmd_db_find (copy, sizeof copy, rails[index].name, &resource) ||
++        !pong_rpmh_vote (resource.address + 8, 7) ||
++        !pong_rpmh_vote (resource.address, rails[index].mv) ||
++        !pong_rpmh_vote (resource.address + 4, 1)) {
++      IOLog ("PONG_UFS: UFS rail %s vote failed\n", rails[index].name);
++      ok = false;
++      break;
++    }
++    IOLog ("PONG_UFS: UFS rail %s address=%08x %umV voted\n",
++           rails[index].name, resource.address, rails[index].mv);
++  }
++  if (ok) {
++    for (unsigned index = 0; index < 2; ++index) {
++      const char *name = index ? "lmx.lvl" : "lcx.lvl";
++      QcomRpmhResourceLocal level = {};
++      uint32_t arc = 0;
++      if (qcom_cmd_db_find (copy, sizeof copy, name, &level) ||
++          qcom_rpmh_level_index (&level, 0xffffffffU, &arc) ||
++          !pong_rpmh_vote (level.address, arc)) {
++        IOLog ("PONG_UFS: %s vote failed\n", name);
++        ok = false;
++        break;
++      }
++      IOLog ("PONG_UFS: %s address=%08x arc=%u voted\n", name, level.address, arc);
++    }
++  }
++  if (ok) {
++    QcomRpmhResourceLocal xo = {};
++    if (!qcom_cmd_db_find (copy, sizeof copy, "xo.lvl", &xo) &&
++        pong_rpmh_vote (xo.address, 3)) {
++      IOLog ("PONG_UFS: XO level vote address=%08x=3\n", xo.address);
++    } else {
++      IOLog ("PONG_UFS: XO level vote failed\n");
++    }
++  }
++  return ok;
++}
++
+ static unsigned serviceCount (const char *name)
+ {
+   OSSharedPtr<OSDictionary> matching (IOService::serviceMatching (name), OSNoRetain);
+@@ -380,7 +452,13 @@ struct UfsHost {
+   {
+     if (!(hce & 1U)) return;
+     uint32_t latched = read32 (base, kInterruptStatus) & kIsUicError;
+-    uint32_t dataLink = read32 (base, kUicErrorDataLink);
++    uint32_t dataLink = 0;
++    for (unsigned spin = 0; spin < 1000; ++spin) {
++      dataLink = read32 (base, kUicErrorDataLink);
++      if (dataLink) break;
++      IODelay (100);
++    }
++    IOLog ("PONG_UFS: link wait saw dl=%08x\n", dataLink);
+     bool degraded = latched || dataLink;
+     if ((status & kHcsDevicePresent) && !degraded) return;
+     if (degraded) {
+@@ -393,15 +471,26 @@ struct UfsHost {
+         write32 (base, offset, read32 (base, offset));
+       write32 (base, kInterruptStatus, kIsUicError);
+     }
+-    for (unsigned spin = 0; spin < 1000 && !(read32 (base, 0x30) & kHcsUicReady); ++spin)
+-      IODelay (10);
+-    uint32_t result = uicLinkStartup (base);
+-    for (unsigned spin = 0; spin < 1000 && !(read32 (base, 0x30) & kHcsDevicePresent); ++spin)
+-      IODelay (10);
+-    IOLog ("PONG_UFS: DME_LINKSTARTUP(%s) result=%08x hcs=%08x dl=%08x->%08x ue=%08x\n",
+-           degraded ? "recover" : "absent", result, read32 (base, 0x30),
+-           dataLink, read32 (base, kUicErrorDataLink),
+-           read32 (base, kInterruptStatus) & kIsUicError);
++    // liuqin: the firmware leaves the UniPro link up. A second LINK_STARTUP on a
++    // live link returns 1 and drives DL 1->0, so when the device is present only
++    // the latched error sources are cleared and the link is left alone. This is
++    // the behaviour the working zizhan tree relies on (it never touches the UIC).
++    uint32_t result = 0;
++    if (read32 (base, 0x30) & kHcsDevicePresent) {
++      IOLog ("PONG_UFS: DME_LINKSTARTUP skipped, device present hcs=%08x dl=%08x ue=%08x\n",
++             read32 (base, 0x30), read32 (base, kUicErrorDataLink),
++             read32 (base, kInterruptStatus) & kIsUicError);
++    } else {
++      for (unsigned spin = 0; spin < 1000 && !(read32 (base, 0x30) & kHcsUicReady); ++spin)
++        IODelay (10);
++      result = uicLinkStartup (base);
++      for (unsigned spin = 0; spin < 1000 && !(read32 (base, 0x30) & kHcsDevicePresent); ++spin)
++        IODelay (10);
++      IOLog ("PONG_UFS: DME_LINKSTARTUP(%s) result=%08x hcs=%08x dl=%08x->%08x ue=%08x\n",
++             degraded ? "recover" : "absent", result, read32 (base, 0x30),
++             dataLink, read32 (base, kUicErrorDataLink),
++             read32 (base, kInterruptStatus) & kIsUicError);
++    }
+     status = read32 (base, 0x30);
+     interruptStatus = read32 (base, kInterruptStatus);
+   }
+@@ -557,6 +646,7 @@ bool NativeUfs::start (IOService *provider)
+   native_ufs_status = 2;
+   pong_ufs_report[ReportStream] = kUfsStreamId;
+ 
++  ufsRailVote ();
+   bringUpClocks (gcc, clkref);
+   bool powered = clocksPowered ();
+   bool buses = clockBusesRunning ();
+diff --git a/drivers/NativeUfs/PongUfsTransport.cpp b/drivers/NativeUfs/PongUfsTransport.cpp
+index cadba81..3fa947b 100644
+--- a/drivers/NativeUfs/PongUfsTransport.cpp
++++ b/drivers/NativeUfs/PongUfsTransport.cpp
+@@ -39,6 +39,7 @@ struct UfsHost {
+   OSSharedPtr<IOMemoryMap> hcMap, smmuMap;
+   uintptr_t hc = 0, smmu = 0, cb = 0;
+   IOBufferMemoryDescriptor *dma = nullptr;
++  bool deviceMapped = false;
+   uint8_t *virt = nullptr;
+   uint64_t phys = 0, blocks = 0;
+   IOLock *lock = nullptr;
+@@ -97,12 +98,14 @@ static IOReturn recordTransport(IOReturn result, uint32_t ocs) {
+   return result;
+ }
+ static void cacheCivac(const void *start, size_t size) {
++  if (gHost.deviceMapped) return;   // device memory: no cache maintenance
+   uintptr_t end = reinterpret_cast<uintptr_t>(start) + size;
+   for (uintptr_t at = reinterpret_cast<uintptr_t>(start) & ~uintptr_t(63); at < end; at += 64)
+     __asm__ volatile("dc civac, %0" :: "r"(at) : "memory");
+   __asm__ volatile("dsb sy" ::: "memory");
+ }
+ static void cacheInvalidate(const void *start, size_t size) {
++  if (gHost.deviceMapped) return;   // device memory: no cache maintenance
+   __asm__ volatile("dsb sy" ::: "memory");
+   uintptr_t end = reinterpret_cast<uintptr_t>(start) + size;
+   for (uintptr_t at = reinterpret_cast<uintptr_t>(start); at < end; at += 64)
+@@ -132,6 +135,7 @@ static bool transportFailure(const char *why) {
+   char text[2400];
+   formatUfsRootDiagnostics(text, sizeof(text), gRootDiagnostic, why, "PONG_UFS TRANSPORT");
+   IOLog("%s\nPONG_UFS: no media published; continue boot\n", text);
++  panic("PONG_UFS: transport failed (%s); diagnostics above", why);
+   PongProbeRecord(4, "ufs-transport", PongProbeFail, why, gRootDiagnostic.result);
+   snprintf(text, sizeof(text), "stage=%s op=%x ocs=%x scsi=%x protocol=%u", gRootDiagnostic.stage,
+            gRootDiagnostic.opcode, gRootDiagnostic.ocs, gRootDiagnostic.scsi, gRootDiagnostic.protocol);
+@@ -154,19 +158,36 @@ static bool hostBringUp() {
+   gRootDiagnostic.cap = read32(gHost.hc, 0);
+   gRootDiagnostic.version = read32(gHost.hc, 8);
+   recordTransport(kIOReturnNotReady, 15);
+-  gRootDiagnostic.stage = "DMA allocation";
+-  gHost.dma = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-    IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous) | IOOptionBits(kIOMemoryMapperNone), kDmaBytes, 4096);
++  // liuqin: SID e0 lives on a firmware translation bank, so a kernel allocation is
++  // not reachable for the controller (v122: NOP OUT submitted, never completed,
++  // SMMU readback showed the mapping unmoved). The loader's own request-list page
++  // is reachable - the firmware read the whole GPT through it - so adopt that page
++  // as device memory and keep the mapping for the lifetime of the driver.
++  gRootDiagnostic.stage = "firmware request list";
++  uint64_t firmwareList = (uint64_t(read32(gHost.hc, 0x54)) << 32) | read32(gHost.hc, 0x50);
++  if (!firmwareList || (firmwareList & 0xfff)) return transportFailure("firmware request list base");
++  static IOMemoryMap *gDeviceListMap = nullptr;
++  if (!gDeviceListMap) {
++    IODeviceMemory *memory = IODeviceMemory::withRange(firmwareList, kDmaBytes);
++    if (!memory) return transportFailure("firmware request list descriptor");
++    gDeviceListMap = memory->map(kIOMapAnywhere | kIOMapInhibitCache);
++    memory->release();
++  }
++  gHost.phys = firmwareList;
++  gHost.virt = gDeviceListMap ? reinterpret_cast<uint8_t *>(gDeviceListMap->getVirtualAddress()) : nullptr;
++  if (!gHost.virt) return transportFailure("firmware request list map");
++  gHost.deviceMapped = true;
+   gHost.lock = IOLockAlloc();
+-  if (!gHost.dma || !gHost.lock) return transportFailure("DMA allocation");
+-  gHost.virt = static_cast<uint8_t *>(gHost.dma->getBytesNoCopy());
+-  IOByteCount contiguous = 0;
+-  gHost.phys = gHost.dma->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
+-  gRootDiagnostic.dma = gHost.phys; gRootDiagnostic.contiguous = contiguous;
+-  if (!gHost.virt || !gHost.phys || (gHost.phys & 4095) || contiguous < kDmaBytes ||
+-      (!(gRootDiagnostic.cap & 0x01000000) && gHost.phys + kDmaBytes > 0x100000000ULL))
+-    return transportFailure("DMA address/contiguity");
+-  bzero(gHost.virt, kDmaBytes); cacheCivac(gHost.virt, kDmaBytes);
++  if (!gHost.lock) return transportFailure("request list lock");
++  gRootDiagnostic.dma = gHost.phys;
++  gRootDiagnostic.contiguous = kDmaBytes;
++  IOLog("PONG_UFS: using the firmware request list at %llx (%u bytes, device mapped)\n",
++        (unsigned long long)gHost.phys, kDmaBytes);
++  {
++    volatile uint32_t *words = reinterpret_cast<volatile uint32_t *>(gHost.virt);
++    for (uint32_t index = 0; index < kDmaBytes / 4; ++index) words[index] = 0;
++    __asm__ volatile("dsb sy" ::: "memory");
++  }
+   gRootDiagnostic.stage = "quiesce firmware queue";
+   const char *why = nullptr;
+   if (!hostStopQueue(&why)) return transportFailure(why);
+@@ -214,29 +235,22 @@ static bool hostBringUp() {
+   } // Release before queue commands or storage readiness notifications.
+   gRootDiagnostic.stage = "request list start";
+   if (!hostStartQueue(&why)) return transportFailure(why);
+-  // shim test_ufs probes with a COMMAND UPIU / TEST UNIT READY, never a NOP.
+-  // Align the first command with the one path proven to read the whole GPT.
+-  gRootDiagnostic.stage = "probe TUR (shim parity)";
+-  uint32_t probeScsi = 0xffff;
+-  bool probeOK = false;
+-  for (unsigned attempt = 0; attempt < 3 && !gHost.poisoned; ++attempt) {
+-    uint8_t probeTur[6] = {};
+-    if (hostScsi(0, probeTur, sizeof(probeTur), false, 0, 200000, &probeScsi) == kIOReturnSuccess) {
+-      probeOK = true;
+-      break;
+-    }
+-  }
+-  if (!probeOK) return transportFailure("probe TUR");
++  // liuqin: the loader parks the device UFS stack, so a NOP first only latches the
++  // UIC error (v131: NOP OUT result=2d6, IS.UE set). Ask the device power mode and
++  // wake it before the link-level NOP, then wait for LUN 0.
+   uint32_t power = 0, scsi = 0;
+   gRootDiagnostic.stage = "power mode query";
+   if (hostQueryRead(3, 2, &power) != kIOReturnSuccess) return transportFailure("power mode query");
+   gRootDiagnostic.power = power;
++  IOLog("PONG_UFS: device bCurrentPowerMode=%02x\n", power & 0xff);
+   if ((power & 0xff) != 0x11) {
+     gRootDiagnostic.stage = "wake device";
+     uint8_t ssu[6] = {0x1b, 0, 0, 0, 0x10, 0};
+     if (hostScsi(0xd0, ssu, 6, false, 0, 500000, &scsi) != kIOReturnSuccess) return transportFailure("START STOP UNIT");
+     IOSleep(50);
+   }
++  gRootDiagnostic.stage = "NOP OUT";
++  if (hostNop() != kIOReturnSuccess) return transportFailure("NOP OUT");
+   gRootDiagnostic.stage = "LUN 0 ready";
+   for (unsigned attempt = 0; attempt < 20 && !gHost.poisoned; ++attempt) {
+     uint8_t tur[6] = {};
+@@ -489,6 +503,7 @@ bool PongUfsBlock::start(IOService *provider) {
+     // UFS controller. Do not invalidate already published OS/SystemOS disks.
+     IOLog("PONG_UFS: %s window has no supported filesystem header base=%llx bytes=%llx; media not published\n",
+           window.name, window.baseByte, window.size);
++    panic("PONG_UFS: %s window has no supported filesystem header", window.name);
+     char detail[96];
+     snprintf(detail, sizeof(detail), "%s filesystem header invalid", window.name);
+     PongProbeRecord(4, "ufs-transport", PongProbeFail, detail, window.baseByte);
+diff --git a/drivers/NativeUfs/RootCommands.h b/drivers/NativeUfs/RootCommands.h
+index 02a9012..3cdf197 100644
+--- a/drivers/NativeUfs/RootCommands.h
++++ b/drivers/NativeUfs/RootCommands.h
+@@ -54,9 +54,9 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
+   gRootDiagnostic.protocol = 0;
+   gRootDiagnostic.residual = 0;
+   gRootDiagnostic.sense = 0;
+-  uint8_t *utrd = gHost.virt;
++  volatile uint8_t *utrd = gHost.virt;
+   uint64_t ucdPhys = gHost.phys + kUcdOffset;
+-  uint32_t *words = reinterpret_cast<uint32_t *> (utrd);
++  volatile uint32_t *words = reinterpret_cast<volatile uint32_t *> (utrd);
+   for (unsigned index = 0; index < 8; index++) {
+     words[index] = 0;
+   }
+@@ -68,7 +68,7 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
+   words[7] = (dataBytes ? 1U : 0U) | ((kPrdtOffset >> 2) << 16);
+   if (dataBytes) {
+     uint64_t dataPhys = gHost.phys + kDataOffset;
+-    uint32_t *prd = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset);
++    volatile uint32_t *prd = reinterpret_cast<volatile uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset);
+     prd[0] = static_cast<uint32_t> (dataPhys);
+     prd[1] = static_cast<uint32_t> (dataPhys >> 32);
+     prd[2] = 0;
+@@ -139,7 +139,7 @@ static bool hostIdle (void)
+ static bool hostClearUcd (void)
+ {
+   if (!hostIdle ()) return false;
+-  uint32_t *words = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset);
++  volatile uint32_t *words = reinterpret_cast<volatile uint32_t *> (gHost.virt + kUcdOffset);
+   for (unsigned index = 0; index < (kPrdtOffset + 16) / 4; index++) {
+     words[index] = 0;
+   }
+diff --git a/drivers/NativeUfs/RootTransportLayout.h b/drivers/NativeUfs/RootTransportLayout.h
+index f6c926e..3b4c0f1 100644
+--- a/drivers/NativeUfs/RootTransportLayout.h
++++ b/drivers/NativeUfs/RootTransportLayout.h
+@@ -4,6 +4,6 @@ enum : uint32_t {
+   kRspOffset = 512,
+   kPrdtOffset = 1024,
+   kDataOffset = 8192,
+-  kDataMax = 131072,
++  kDataMax = 8192,
+   kDmaBytes = kDataOffset + kDataMax,
+ };
