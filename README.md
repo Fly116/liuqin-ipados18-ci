@@ -58,3 +58,22 @@
 内核已能跑到「等待根设备」（v114，含 AppleARMCPU DT 校验的二进制绕过补丁），
 唯一阻塞是 NativeUfs 的 TUR 探测无完成中断；详见设备仓库
 `docs/ufs-tur-analysis-2026-11-22.md` 与 `docs/v114-root-device-ufs-2026-11-22.md`。
+
+
+## 2026-11-23：UFS bring-up 变体（q–z）
+
+本轮变体补丁目录 `ci/patches-variants/{q,r,s,t,u,v,w,x,y,z}/`：
+
+- q：RPMh 电源轨投票（ldob5/ldoc10）+ QMP PHY 初始化 + UIC bring-up
+- r：N + 两轨投票（信任链路，不碰 UIC）
+- s：O + 两轨投票 + 等待链路（volatile 描述符）
+- t：s + 设备轨（ldob7/ldob9）+ CX/MX + 查询优先
+- u：q + 全部电源轨 + 查询优先
+- v：GCC CBCR 位语义修正、GDSC、v6 PHY reset、volatile 描述符（v134 首次 transport ready）
+- w：liuqin GPT 几何 + SHNGROOT 诊断（v135）
+- x：Data 窗口接受裸 APFS + 跳过坏窗口（v136 进入用户态）
+- y：恢复 UFS 写路径（pong_ufs_readwrite）
+- z：SystemOS union 配置 + init 诊断（union 模式实验）
+
+workflow 新增：ccache、触摸固件注入（`LIUQIN_TOUCH_FW_DIR=ci/firmware`，厂商镜像只存在本私有仓库）、SystemOS union 配置步骤（union=1 要求 CRYPTEX_FILES=0）。
+记录文档：https://github.com/Fly116/UniXNU-liuqin/blob/main/docs/ufs-bringup-2026-11-23.md
