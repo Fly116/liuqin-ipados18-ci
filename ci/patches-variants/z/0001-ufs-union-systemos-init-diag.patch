@@ -1,16 +1,3 @@
-diff --git a/configs/liuqin_ipados18_defconfig b/configs/liuqin_ipados18_defconfig
-index aaaf5d9..96e520b 100644
---- a/configs/liuqin_ipados18_defconfig
-+++ b/configs/liuqin_ipados18_defconfig
-@@ -53,7 +53,7 @@ CONFIG_XNU_OWNER_DATA_VOLUME_UUID=""
- CONFIG_XNU_OWNER_CACHE_VOLUME_UUID=""
- CONFIG_XNU_OWNER_ROOT_AUDIT=n
- CONFIG_XNU_OWNER_ROOT_TRUST=n
--CONFIG_XNU_OWNER_UNION_SYSTEMOS=n
-+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
- CONFIG_XNU_PONG_APFS_DEBUG=y
- CONFIG_XNU_PONG_ADRENO_PLATFORM=n
- CONFIG_XNU_PONG_BACKLIGHT=y
 diff --git a/drivers/NativeUfs/NativeUfs.cpp b/drivers/NativeUfs/NativeUfs.cpp
 index 2bbc068..3386e7d 100644
 --- a/drivers/NativeUfs/NativeUfs.cpp
