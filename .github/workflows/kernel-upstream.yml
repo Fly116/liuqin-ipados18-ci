@@ -277,6 +277,18 @@ jobs:
           python3 ./unixnu ipsw fetch KernelCache -D ../device \
             --local-module "soc:sm8475=$GITHUB_WORKSPACE/device/migration/format2/soc-seed"
 
+      - name: touch firmware
+        run: |
+          set -euo pipefail
+          # Vendor NT36532 images for liuqin: private CI repo only, never the public
+          # device tree. build-xnu-ipados18.sh embeds them into the kernel when this
+          # environment variable names a directory holding both files.
+          dir="$GITHUB_WORKSPACE/ci-repo/ci/firmware"
+          test -f "$dir/novatek_nt36532_m81_fw_csot.bin"
+          test -f "$dir/novatek_nt36532_m81_fw_tm.bin"
+          echo "LIUQIN_TOUCH_FW_DIR=$dir" >> "$GITHUB_ENV"
+          ls -l "$dir"
+
       - name: build the kernel
         working-directory: UniXNU
         env:
