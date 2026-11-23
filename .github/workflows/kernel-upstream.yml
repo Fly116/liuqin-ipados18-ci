@@ -213,8 +213,15 @@ jobs:
           old = "CONFIG_XNU_OWNER_UNION_SYSTEMOS=n"
           if old not in text:
               raise SystemExit(old + " is not in " + str(path))
-          path.write_text(text.replace(old, "CONFIG_XNU_OWNER_UNION_SYSTEMOS=y"))
-          print("SystemOS union enabled for dyld")
+          # union and the cryptex-file mechanism are mutually exclusive in the
+          # kernel build (union requires CACHE_STARTUP=1, CRYPTEX_FILES=0).
+          cryptex = "CONFIG_XNU_OWNER_CRYPTEX_FILES=y"
+          if cryptex not in text:
+              raise SystemExit(cryptex + " is not in " + str(path))
+          text = text.replace(old, "CONFIG_XNU_OWNER_UNION_SYSTEMOS=y")
+          text = text.replace(cryptex, "CONFIG_XNU_OWNER_CRYPTEX_FILES=n")
+          path.write_text(text)
+          print("SystemOS union enabled for dyld; cryptex files off")
           PY
           grep -n CONFIG_XNU_OWNER_UNION_SYSTEMOS device/configs/liuqin_ipados18_defconfig
 
