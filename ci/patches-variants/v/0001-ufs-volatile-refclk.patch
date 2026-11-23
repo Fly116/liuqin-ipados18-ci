@@ -1,0 +1,831 @@
+diff --git a/drivers/NativeUfs/NativeUfs.cpp b/drivers/NativeUfs/NativeUfs.cpp
+index 2bbc068..3386e7d 100644
+--- a/drivers/NativeUfs/NativeUfs.cpp
++++ b/drivers/NativeUfs/NativeUfs.cpp
+@@ -24,6 +24,7 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include "../PongProbe.h"
++#include "PongUfsPhyTables.h"
+ extern "C" bool pong_ufs_transport_start(IOService *);
+ 
+ extern "C" {
+@@ -46,7 +47,7 @@ constexpr uint64_t kUfsHostBytes = 0x3000ULL;
+ // RX at 0x1200. SM8475 selects qmp_ufs_offsets_v6, so the older
+ // 0x400/0x600/0xc00 grouping names the wrong blocks -- 0x400 is PCS, not TX.
+ constexpr uint64_t kUfsPhyPage = 0x01d80000ULL;
+-constexpr uint64_t kUfsPhyBytes = 0x2000ULL;
++constexpr uint64_t kUfsPhyBytes = 0x9000ULL;   // primary window + the v5 alias at +0x7000
+ constexpr unsigned kPhySerdes = 0x000;
+ constexpr unsigned kPhyPcs = 0x400;
+ constexpr unsigned kPhyTx = 0x1000;
+@@ -59,14 +60,15 @@ constexpr unsigned kPcsReady = 0x1a8;
+ constexpr uint32_t kPcsReadyBit = 1U << 0;
+ constexpr uint32_t kUfsStreamId = 0xe0;
+ 
+-// GDSC: bit31 is PWR_ON, bit30 is SW_COLLAPSE. CBCR bit0 is CLK_OFF, so a gate
+-// that is running reads zero there. The same page holds the block reset the
++// GDSC: bit31 is PWR_ON, bit0 is SW_COLLAPSE. CBCR bit0 is ENABLE;
++// bit31 is CLK_OFF (read-only status). Enable and status are distinct. The same page holds the block reset the
+ // board description gives the controller (GCC_UFS_PHY_BCR, 0x87000); while it
+ // is asserted the whole host window ignores writes.
+ constexpr unsigned kGdscOffset = 0x004;
+ constexpr uint32_t kGdscPowerOn = 1U << 31;
+-constexpr uint32_t kGdscSwCollapse = 1U << 30;
+-constexpr uint32_t kGateClockOff = 1U;
++constexpr uint32_t kGdscSwCollapse = 1U;
++constexpr uint32_t kGateEnable = 1U;
++constexpr uint32_t kGateClockOff = 1U << 31;
+ constexpr unsigned kBcrOffset = 0x000;
+ constexpr uint32_t kBcrAsserted = 1U;
+ 
+@@ -115,21 +117,132 @@ static void write32 (uintptr_t base, unsigned offset, uint32_t value)
+   *reinterpret_cast<volatile uint32_t *> (base + offset) = value;
+ }
+ 
+-static uint32_t uicLinkStartup (uintptr_t host)
++constexpr uint32_t kDmeGet = 0x01;
++constexpr uint32_t kDmeSet = 0x02;
++constexpr uint32_t kDmeReset = 0x14;
++constexpr uint32_t kMibAvailableTxLanes = 0x1520U << 16;
++constexpr uint32_t kMibActiveTxLanes = 0x1560U << 16;
++constexpr uint32_t kMibActiveRxLanes = 0x1580U << 16;
++constexpr uint32_t kMibMaxRxGear = 0x1587U << 16;
++constexpr uint32_t kMibRxGear = 0x1583U << 16;
++constexpr uint32_t kMibTxGear = 0x1568U << 16;
++constexpr uint32_t kMibRxTermination = 0x1584U << 16;
++constexpr uint32_t kMibTxTermination = 0x1569U << 16;
++constexpr uint32_t kMibHsSeries = 0x156AU << 16;
++constexpr uint32_t kMibPowerMode = 0x1571U << 16;
++
++// One UIC command: ARG_2 carries the result, ARG_3 a DME_GET value.
++static uint32_t uicCommand (uintptr_t host, uint32_t opcode, uint32_t arg1,
++                            uint32_t arg2, uint32_t arg3, uint32_t *value)
+ {
+-  write32 (host, kUicArg1, 0);
+-  write32 (host, kUicArg2, 0);
+-  write32 (host, kUicArg3, 0);
+-  write32 (host, 0x20, kUicDone);            // drop a stale completion
+-  write32 (host, kUicCommand, kDmeLinkStartup);
++  for (unsigned spin = 0; spin < 1000 && !(read32 (host, 0x30) & kHcsUicReady); ++spin)
++    IODelay (10);
++  if (!(read32 (host, 0x30) & kHcsUicReady)) return 0xffffffffU;
++  write32 (host, kUicArg1, arg1);
++  write32 (host, kUicArg2, arg2);
++  write32 (host, kUicArg3, arg3);
++  write32 (host, 0x20, kUicDone);
++  write32 (host, kUicCommand, opcode);
+   for (unsigned spin = 0; spin < 20000; ++spin) {
+     if (read32 (host, 0x20) & kUicDone) {
+       write32 (host, 0x20, kUicDone);
+-      return read32 (host, kUicArg2);        // result code in the low byte
++      if (value) *value = read32 (host, kUicArg3);
++      return read32 (host, kUicArg2);
+     }
+     IODelay (10);
+   }
+-  return 0xffffffffU;                        // never completed
++  return 0xffffffffU;
++}
++
++// ------------------------------- QMP PHY --------------------------------
++// SM8475 v6 layout, validated against Linux qmp_ufs_offsets_v6.
++static void phyWriteTable (uintptr_t phy, unsigned block, const PongPhyReg *table, unsigned count)
++{
++  for (unsigned index = 0; index < count; ++index)
++    write32 (phy, block + table[index].offset, table[index].value);
++}
++
++static bool phyBringUpV6 (uintptr_t host, uintptr_t phy)
++{
++  const unsigned pcs = 0x400, tx = 0x1000, rx = 0x1200, ready = 0x1a8;
++  uint32_t readyBefore = read32 (phy, pcs + ready);
++  // Qualcomm UFS CFG1 +0xdc bit1 is PHY_SOFT_RESET, not the GCC block reset.
++  write32 (phy, pcs + 0x004, read32 (phy, pcs + 0x004) | 1U);
++  uint32_t cfg = read32 (host, 0xdc);
++  write32 (host, 0xdc, cfg | 2U);
++  (void)read32 (host, 0xdc);
++  IODelay (1000);
++  phyWriteTable (phy, 0x000, kPhyTableV6Serdes, sizeof (kPhyTableV6Serdes) / sizeof (kPhyTableV6Serdes[0]));
++  phyWriteTable (phy, tx, kPhyTableV6Tx, sizeof (kPhyTableV6Tx) / sizeof (kPhyTableV6Tx[0]));
++  phyWriteTable (phy, tx + 0x800, kPhyTableV6Tx, sizeof (kPhyTableV6Tx) / sizeof (kPhyTableV6Tx[0]));
++  phyWriteTable (phy, rx, kPhyTableV6Rx, sizeof (kPhyTableV6Rx) / sizeof (kPhyTableV6Rx[0]));
++  phyWriteTable (phy, rx + 0x800, kPhyTableV6Rx, sizeof (kPhyTableV6Rx) / sizeof (kPhyTableV6Rx[0]));
++  phyWriteTable (phy, pcs, kPhyTableV6Pcs, sizeof (kPhyTableV6Pcs) / sizeof (kPhyTableV6Pcs[0]));
++  phyWriteTable (phy, 0x000, kPhyTableV6SerdesG4, sizeof (kPhyTableV6SerdesG4) / sizeof (kPhyTableV6SerdesG4[0]));
++  phyWriteTable (phy, tx, kPhyTableV6TxG4, sizeof (kPhyTableV6TxG4) / sizeof (kPhyTableV6TxG4[0]));
++  phyWriteTable (phy, tx + 0x800, kPhyTableV6TxG4, sizeof (kPhyTableV6TxG4) / sizeof (kPhyTableV6TxG4[0]));
++  phyWriteTable (phy, rx, kPhyTableV6RxG4, sizeof (kPhyTableV6RxG4) / sizeof (kPhyTableV6RxG4[0]));
++  phyWriteTable (phy, rx + 0x800, kPhyTableV6RxG4, sizeof (kPhyTableV6RxG4) / sizeof (kPhyTableV6RxG4[0]));
++  phyWriteTable (phy, pcs, kPhyTableV6PcsG4, sizeof (kPhyTableV6PcsG4) / sizeof (kPhyTableV6PcsG4[0]));
++  // Linux HS-B overlay follows base and G4 tables; UIC below selects series B.
++  write32 (phy, 0x140, 0x44);
++  write32 (host, 0xdc, read32 (host, 0xdc) & ~2U);
++  (void)read32 (host, 0xdc);
++  IODelay (1000);
++  write32 (phy, pcs + 0x008, read32 (phy, pcs + 0x008) & ~1U);
++  write32 (phy, pcs + 0x000, read32 (phy, pcs + 0x000) | 1U);
++  bool ok = false;
++  for (unsigned spin = 0; spin < 500; ++spin) {
++    if (read32 (phy, pcs + ready) & 1U) { ok = true; break; }
++    IODelay (200);
++  }
++  IOLog ("PONG_UFS: PHY v6 @%llx ready=%u ready=%08x->%08x serdes=%08x tx=%08x rx=%08x\n",
++         (unsigned long long)phy, ok, readyBefore, read32 (phy, pcs + ready),
++         read32 (phy, 0x000), read32 (phy, tx), read32 (phy, rx));
++  return ok;
++}
++
++static bool phyBringUpAuto (uintptr_t host, uintptr_t primary, uintptr_t alternate)
++{
++  (void)alternate;
++  if (!primary || !host) return false;
++  IOLog ("PONG_UFS: SM8475 v6 PHY init; scratch write test removed\n");
++  return phyBringUpV6 (host, primary);
++}
++
++// Full UIC bring-up: lane pre-config, link startup with one DME_RESET retry, then
++// gear/termination/RXTX power mode.
++static uint32_t uicBringUp (uintptr_t host)
++{
++  uint32_t lanes = 0, gear = 0;
++  uint32_t result = uicCommand (host, kDmeGet, kMibAvailableTxLanes, 0, 0, &lanes);
++  IOLog ("PONG_UFS: UIC available lanes result=%08x lanes=%08x\n", result, lanes);
++  if (result || !lanes || lanes > 2U) lanes = 2U;
++  uint32_t tx = uicCommand (host, kDmeSet, kMibActiveTxLanes, 0, lanes, nullptr);
++  uint32_t rx = uicCommand (host, kDmeSet, kMibActiveRxLanes, 0, lanes, nullptr);
++  IOLog ("PONG_UFS: UIC active lanes tx=%08x rx=%08x\n", tx, rx);
++  result = uicCommand (host, kDmeLinkStartup, 0, 0, 0, nullptr);
++  if (result) {
++    uint32_t reset = uicCommand (host, kDmeReset, 0, 0, 0, nullptr);
++    IOLog ("PONG_UFS: UIC DME_RESET result=%08x; retrying link startup\n", reset);
++    IODelay (1000);
++    result = uicCommand (host, kDmeLinkStartup, 0, 0, 0, nullptr);
++  }
++  if (result) return result;
++  uint32_t queried = uicCommand (host, kDmeGet, kMibMaxRxGear, 0, 0, &gear);
++  IOLog ("PONG_UFS: UIC max gear result=%08x gear=%08x\n", queried, gear);
++  if (!gear || gear > 4U) gear = 4U;
++  uint32_t setGear = uicCommand (host, kDmeSet, kMibRxGear, 0, gear, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibTxGear, 0, gear, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibActiveRxLanes, 0, lanes, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibActiveTxLanes, 0, lanes, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibRxTermination, 0, 1, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibTxTermination, 0, 1, nullptr);
++  setGear |= uicCommand (host, kDmeSet, kMibHsSeries, 0, 2, nullptr);
++  uint32_t power = uicCommand (host, kDmeSet, kMibPowerMode, 0, 0x11, nullptr);
++  IOLog ("PONG_UFS: UIC gear/lanes set=%08x power=%08x hcs=%08x\n",
++         setGear, power, read32 (host, 0x30));
++  return power;
+ }
+ 
+ static bool contains (const char *data, size_t length, const char *needle)
+@@ -169,6 +282,73 @@ static uintptr_t mapPhysical (uint64_t physical, uint64_t bytes,
+   return mapping ? static_cast<uintptr_t> (mapping->getVirtualAddress ()) : 0;
+ }
+ 
++// The UFS PHY's analogue rails are PM8350B L5 (vdda-phy) and PM8350C L10
++// (vdda-pll). PongUsbPhy votes exactly these two for the shared USB PHY; nothing
++// votes them in a UFS-only boot, which is why every PHY register read back zero
++// and the write tests were dropped (v119-v124). Same byte sequence as UsbPhy:
++// mode at resource+8, voltage (mV) at resource+0, enable at resource+4.
++extern "C" bool pong_rpmh_vote (uint32_t address, uint32_t value);
++extern "C" int qcom_cmd_db_find (const unsigned char *db, unsigned long bytes,
++                                 const char *name, void *out);
++extern "C" int qcom_rpmh_level_index (const void *resource, uint32_t level, uint32_t *index);
++struct QcomRpmhResourceLocal {
++  uint32_t address;
++  uint16_t levels[16];
++  unsigned level_count;
++};
++
++static bool phyRailVote ()
++{
++  OSSharedPtr<IOMemoryMap> map;
++  uintptr_t db = mapPhysical (0x80860000, 0x20000, map);
++  if (!db) {
++    IOLog ("PONG_UFS: cmd-db map failed; PHY rails not voted\n");
++    return false;
++  }
++  static unsigned char copy[0x20000];
++  memcpy (copy, reinterpret_cast<const void *>(db), sizeof copy);
++  bool ok = true;
++  struct Rail { const char *name; uint32_t mv; };
++  const Rail rails[] = {{"ldob5", 880}, {"ldoc10", 1200},
++                        {"ldob7", 2504}, {"ldob9", 1200}};
++  for (unsigned index = 0; index < sizeof rails / sizeof rails[0]; ++index) {
++    QcomRpmhResourceLocal resource = {};
++    if (qcom_cmd_db_find (copy, sizeof copy, rails[index].name, &resource) ||
++        !pong_rpmh_vote (resource.address + 8, 7) ||
++        !pong_rpmh_vote (resource.address, rails[index].mv) ||
++        !pong_rpmh_vote (resource.address + 4, 1)) {
++      IOLog ("PONG_UFS: PHY rail %s vote failed\n", rails[index].name);
++      ok = false;
++      break;
++    }
++    IOLog ("PONG_UFS: PHY rail %s address=%08x %umV voted\n",
++           rails[index].name, resource.address, rails[index].mv);
++  }
++  if (ok) {
++    for (unsigned index = 0; index < 2; ++index) {
++      const char *name = index ? "lmx.lvl" : "lcx.lvl";
++      QcomRpmhResourceLocal level = {};
++      uint32_t arc = 0;
++      if (qcom_cmd_db_find (copy, sizeof copy, name, &level) ||
++          qcom_rpmh_level_index (&level, 0xffffffffU, &arc) ||
++          !pong_rpmh_vote (level.address, arc)) {
++        IOLog ("PONG_UFS: %s vote failed\n", name);
++        ok = false;
++        break;
++      }
++      IOLog ("PONG_UFS: %s address=%08x arc=%u voted\n", name, level.address, arc);
++    }
++  }
++  if (ok) {
++    QcomRpmhResourceLocal xo = {};
++    if (!qcom_cmd_db_find (copy, sizeof copy, "xo.lvl", &xo) &&
++        pong_rpmh_vote (xo.address, 3)) {
++      IOLog ("PONG_UFS: XO level vote address=%08x=3\n", xo.address);
++    }
++  }
++  return ok;
++}
++
+ static unsigned serviceCount (const char *name)
+ {
+   OSSharedPtr<OSDictionary> matching (IOService::serviceMatching (name), OSNoRetain);
+@@ -237,27 +417,42 @@ static void sampleClocks (uintptr_t gcc)
+     pong_ufs_report[gate.report] = read32 (gcc, gate.offset);
+ }
+ 
+-// Same CBCR semantic as the gates below: bit0 is CLK_OFF, so clearing it turns
+-// the reference clock on. gcc_ufs_0_clkref_en uses clk_branch2_ops with
+-// halt_check BRANCH_HALT, so the bit coming back as zero is the whole proof.
+-static void bringUpReferenceClock (uintptr_t clkref)
++// Qualcomm clk_branch2: set BRANCH_ENABLE (bit0), poll CLK_OFF (bit31).
++// Never clear the enable bit in an attempt to clear the status bit.
++static bool branchRunning (uint32_t value, bool hwcg)
+ {
+-  if (!clkref) {
+-    IOLog ("PONG_UFS: reference clock page not mapped\n");
+-    return;
+-  }
+-  uint32_t value = read32 (clkref, kUfsClkrefOffset);
+-  if (!(value & kGateClockOff)) {
+-    IOLog ("PONG_UFS: reference clock already on %08x\n", value);
+-    return;
++  return (value & kGateEnable) &&
++         ((hwcg && (value & 2U)) || !(value & kGateClockOff) ||
++          ((value >> 28) & 7U) == 2U);
++}
++
++static bool enableClock (uintptr_t base, unsigned offset, const char *name,
++                         bool hwcg = false, bool symbol = false)
++{
++  if (!base) {
++    IOLog ("PONG_UFS: clock %s not mapped\n", name);
++    return false;
+   }
+-  write32 (clkref, kUfsClkrefOffset, value & ~kGateClockOff);
+-  for (unsigned spin = 0; spin < 1000; ++spin) {
+-    if (!(read32 (clkref, kUfsClkrefOffset) & kGateClockOff)) break;
++  uint32_t before = read32 (base, offset);
++  write32 (base, offset, before | kGateEnable);
++  __asm__ volatile("dsb sy" ::: "memory");
++  unsigned spin = 0;
++  for (; spin < 1000; ++spin) {
++    uint32_t now = read32 (base, offset);
++    if (symbol ? (now & kGateEnable) != 0 : branchRunning (now, hwcg)) break;
+     IODelay (10);
+   }
+-  IOLog ("PONG_UFS: reference clock CLK_OFF cleared %08x -> %08x\n",
+-         value, read32 (clkref, kUfsClkrefOffset));
++  if (symbol) IODelay (10);
++  uint32_t after = read32 (base, offset);
++  bool running = symbol ? (after & kGateEnable) != 0 : branchRunning (after, hwcg);
++  IOLog ("PONG_UFS: clock %s enable %08x->%08x running=%u wait=%u\n",
++         name, before, after, running, spin);
++  return running;
++}
++
++static bool bringUpReferenceClock (uintptr_t clkref)
++{
++  return enableClock (clkref, kUfsClkrefOffset, "reference");
+ }
+ 
+ // GCC_UFS_PHY_BCR (gcc-sm8450.c reset map, 0x87000 bit0) is the block reset the
+@@ -306,16 +501,11 @@ static void bringUpClocks (uintptr_t gcc, uintptr_t clkref)
+            gdsc, read32 (gcc, kGdscOffset));
+   }
+ 
++  // TX/RX symbol branches may remain halted until PHY/link starts. Log every
++  // gate, but only bus clocks are prerequisites for touching the host below.
+   for (const auto &gate : kClockGates) {
+-    uint32_t value = read32 (gcc, gate.offset);
+-    if (!(value & kGateClockOff)) continue;
+-    write32 (gcc, gate.offset, value & ~kGateClockOff);
+-    for (unsigned spin = 0; spin < 1000; ++spin) {
+-      if (!(read32 (gcc, gate.offset) & kGateClockOff)) break;
+-      IODelay (10);
+-    }
+-    IOLog ("PONG_UFS: clock %s CLK_OFF cleared %08x -> %08x\n",
+-           gate.name, value, read32 (gcc, gate.offset));
++    bool symbol = gate.report == ReportTx || gate.report == ReportRx0 || gate.report == ReportRx1;
++    enableClock (gcc, gate.offset, gate.name, !symbol, symbol);
+   }
+ 
+   sampleClocks (gcc);
+@@ -328,9 +518,9 @@ static bool clocksPowered ()
+ 
+ static bool clockBusesRunning ()
+ {
+-  return !(pong_ufs_report[ReportAxi] & kGateClockOff) &&
+-         !(pong_ufs_report[ReportAhb] & kGateClockOff) &&
+-         !(pong_ufs_report[ReportAggregate] & kGateClockOff);
++  return branchRunning (pong_ufs_report[ReportAxi], true) &&
++         branchRunning (pong_ufs_report[ReportAhb], true) &&
++         branchRunning (pong_ufs_report[ReportAggregate], true);
+ }
+ 
+ // ------------------------------------------------------------ controller ---
+@@ -339,6 +529,7 @@ static bool clockBusesRunning ()
+ // registry properties all describe the same moment.
+ struct UfsHost {
+   uintptr_t base;
++  uintptr_t phy = 0, phyAlt = 0, gcc = 0;
+   uint32_t capability;
+   uint32_t version;
+   uint32_t interruptStatus;
+@@ -384,23 +575,20 @@ struct UfsHost {
+     bool degraded = latched || dataLink;
+     if ((status & kHcsDevicePresent) && !degraded) return;
+     if (degraded) {
+-      // IS.UE is re-latched by a live UIC error source. Clearing only the
+-      // summary bit leaves UECDL (replay timeout) armed, so LINKSTARTUP
+-      // fails and the controller keeps refusing the request doorbell.
+-      // UECPA/UECDL/UECN/UECT/UECDME are write-one-to-clear; write back
+-      // exactly what was read so no concurrent error is acknowledged.
++      // Acknowledge IS.UE only; error codes are not W1C.
++      // UIC error-code registers are sampled, not written as W1C.
+       for (unsigned offset = 0x38; offset <= 0x48; offset += 4)
+-        write32 (base, offset, read32 (base, offset));
++        (void)read32 (base, offset);
+       write32 (base, kInterruptStatus, kIsUicError);
+     }
+-    for (unsigned spin = 0; spin < 1000 && !(read32 (base, 0x30) & kHcsUicReady); ++spin)
+-      IODelay (10);
+-    uint32_t result = uicLinkStartup (base);
++    // Diagnostic cold bring-up after an absent/degraded handover.
++    if (!phyBringUpAuto (base, phy, phyAlt))
++      IOLog ("PONG_UFS: PHY bring-up failed; attempting the link anyway\n");
++    uint32_t result = uicBringUp (base);
+     for (unsigned spin = 0; spin < 1000 && !(read32 (base, 0x30) & kHcsDevicePresent); ++spin)
+       IODelay (10);
+-    IOLog ("PONG_UFS: DME_LINKSTARTUP(%s) result=%08x hcs=%08x dl=%08x->%08x ue=%08x\n",
+-           degraded ? "recover" : "absent", result, read32 (base, 0x30),
+-           dataLink, read32 (base, kUicErrorDataLink),
++    IOLog ("PONG_UFS: link startup result=%08x hcs=%08x dl=%08x->%08x ue=%08x\n",
++           result, read32 (base, 0x30), dataLink, read32 (base, kUicErrorDataLink),
+            read32 (base, kInterruptStatus) & kIsUicError);
+     status = read32 (base, 0x30);
+     interruptStatus = read32 (base, kInterruptStatus);
+@@ -557,27 +745,36 @@ bool NativeUfs::start (IOService *provider)
+   native_ufs_status = 2;
+   pong_ufs_report[ReportStream] = kUfsStreamId;
+ 
++  bool rails = phyRailVote ();
+   bringUpClocks (gcc, clkref);
+   bool powered = clocksPowered ();
+   bool buses = clockBusesRunning ();
++  uint32_t ref = clkref ? read32 (clkref, kUfsClkrefOffset) : kGateClockOff;
++  bool reference = branchRunning (ref, false);
++  IOLog ("PONG_UFS: prerequisites powered=%u buses=%u reference=%u ref=%08x\n",
++         powered, buses, reference, ref);
+ 
+   UfsHost host = {};
+-  if (powered && buses) {
++  if (rails && powered && buses && reference) {
+     IOLog ("PONG_UFS: clocks active, read host state\n");
+     host.base = mapPhysical (kUfsHost, kUfsHostBytes, hostMap);
+     if (!host.base) return probeFailure ("host map failed");
+     native_ufs_status = 3;
+     host.sample ();
+     host.enableController ();
+-    probePhy (mapPhysical (kUfsPhyPage, kUfsPhyBytes, phyMap));
++    host.phy = mapPhysical (kUfsPhyPage, kUfsPhyBytes, phyMap);
++    host.phyAlt = host.phy ? host.phy + 0x7000 : 0;
++    probePhy (host.phy);
++    IOLog ("PONG_UFS: PHY primary=%llx alt=%llx\n",
++           (unsigned long long)host.phy, (unsigned long long)host.phyAlt);
+     host.requestLink ();
+     host.publish ();
+     native_ufs_status = 4;
+   }
+ 
+   dumpSnapshot (powered, buses);
+-  if (!powered || !buses)
+-    return probeFailure ("power/clocks unavailable; host access skipped");
++  if (!rails || !powered || !buses || !reference)
++    return probeFailure ("power/clocks unavailable; PHY/UIC/transport skipped");
+   if (!host.version || host.version == 0xffffffffU || !(host.hce & 1U))
+     return probeFailure ("host disabled or invalid version", host.hce);
+ 
+diff --git a/drivers/NativeUfs/PongUfsPhyTables.h b/drivers/NativeUfs/PongUfsPhyTables.h
+new file mode 100644
+index 0000000..50d3e3a
+--- /dev/null
++++ b/drivers/NativeUfs/PongUfsPhyTables.h
+@@ -0,0 +1,191 @@
++// Generated from Linux drivers/phy/qualcomm/phy-qcom-qmp-ufs.c by
++// docs/make-phy-tables.py. Offsets are block-relative.
++struct PongPhyReg { uint32_t offset; uint32_t value; };
++
++static const PongPhyReg kPhyTableV6Serdes[] = {
++  { 0x110, 0xd9 },
++  { 0x174, 0x16 },
++  { 0x03c, 0x11 },
++  { 0x09c, 0x00 },
++  { 0x120, 0x01 },
++  { 0x148, 0x00 },
++  { 0x088, 0x82 },
++  { 0x074, 0x18 },
++  { 0x078, 0x18 },
++  { 0x080, 0xff },
++  { 0x084, 0x0c },
++};
++
++static const PongPhyReg kPhyTableV6Tx[] = {
++  { 0x07c, 0x05 },
++  { 0x030, 0x07 },
++};
++
++static const PongPhyReg kPhyTableV6Rx[] = {
++  { 0x0d4, 0x0c },
++  { 0x208, 0xc2 },
++  { 0x20c, 0xc2 },
++  { 0x214, 0x1a },
++  { 0x220, 0x60 },
++  { 0x238, 0x9e },
++  { 0x244, 0x60 },
++  { 0x25c, 0x9e },
++  { 0x260, 0x0e },
++  { 0x264, 0x36 },
++  { 0x270, 0x02 },
++};
++
++static const PongPhyReg kPhyTableV6Pcs[] = {
++  { 0x18c, 0x69 },
++  { 0x030, 0x0f },
++  { 0x1f4, 0x43 },
++  { 0x1fc, 0x02 },
++};
++
++static const PongPhyReg kPhyTableV6SerdesG4[] = {
++  { 0x140, 0x04 },
++  { 0x0f4, 0x0f },
++  { 0x070, 0x14 },
++  { 0x028, 0x98 },
++  { 0x010, 0x14 },
++  { 0x014, 0x18 },
++  { 0x018, 0x18 },
++  { 0x020, 0x32 },
++  { 0x024, 0x0f },
++};
++
++static const PongPhyReg kPhyTableV6TxG4[] = {
++  { 0x108, 0x4c },
++};
++
++static const PongPhyReg kPhyTableV6RxG4[] = {
++  { 0x178, 0x0e },
++};
++
++static const PongPhyReg kPhyTableV6PcsG4[] = {
++  { 0x02c, 0x0b },
++  { 0x074, 0x04 },
++  { 0x0bc, 0x04 },
++};
++
++static const PongPhyReg kPhyTableV5Serdes[] = {
++  { 0x094, 0xd9 },
++  { 0x158, 0x11 },
++  { 0x15c, 0x00 },
++  { 0x0a4, 0x42 },
++  { 0x10c, 0x02 },
++  { 0x058, 0x0f },
++  { 0x124, 0x00 },
++  { 0x1bc, 0x11 },
++  { 0x0bc, 0x82 },
++  { 0x074, 0x14 },
++  { 0x07c, 0x18 },
++  { 0x084, 0x18 },
++  { 0x0ac, 0xff },
++  { 0x0b0, 0x19 },
++  { 0x1ac, 0xac },
++  { 0x1b0, 0x1e },
++  { 0x0c4, 0x98 },
++  { 0x078, 0x14 },
++  { 0x080, 0x18 },
++  { 0x088, 0x18 },
++  { 0x0b4, 0x65 },
++  { 0x0b8, 0x1e },
++  { 0x1b4, 0xdd },
++  { 0x1b8, 0x23 },
++};
++
++static const PongPhyReg kPhyTableV5Tx[] = {
++  { 0x178, 0x06 },
++  { 0x17c, 0x03 },
++  { 0x180, 0x01 },
++  { 0x184, 0x00 },
++  { 0x084, 0xf5 },
++  { 0x08c, 0x3f },
++  { 0x03c, 0x09 },
++  { 0x040, 0x09 },
++  { 0x0c0, 0x0c },
++};
++
++static const PongPhyReg kPhyTableV5Rx[] = {
++  { 0x120, 0x24 },
++  { 0x11c, 0x0f },
++  { 0x124, 0x1e },
++  { 0x128, 0x18 },
++  { 0x030, 0x0a },
++  { 0x034, 0x5a },
++  { 0x044, 0xf1 },
++  { 0x03c, 0x80 },
++  { 0x048, 0x80 },
++  { 0x008, 0x0e },
++  { 0x014, 0x04 },
++  { 0x080, 0x1b },
++  { 0x0e8, 0x04 },
++  { 0x0ec, 0x06 },
++  { 0x0f0, 0x04 },
++  { 0x0f4, 0x1a },
++  { 0x110, 0x17 },
++  { 0x114, 0x00 },
++  { 0x100, 0x10 },
++  { 0x0f8, 0xc0 },
++  { 0x0fc, 0x00 },
++  { 0x15c, 0x6d },
++  { 0x160, 0x6d },
++  { 0x164, 0xed },
++  { 0x168, 0x3b },
++  { 0x16c, 0x3c },
++  { 0x170, 0xe0 },
++  { 0x174, 0xc8 },
++  { 0x178, 0xc8 },
++  { 0x17c, 0x3b },
++  { 0x180, 0xb7 },
++  { 0x184, 0xe0 },
++  { 0x188, 0xc8 },
++  { 0x18c, 0xc8 },
++  { 0x190, 0x3b },
++  { 0x194, 0xb7 },
++  { 0x1a8, 0x0c },
++};
++
++static const PongPhyReg kPhyTableV5Pcs[] = {
++  { 0x158, 0x6d },
++  { 0x030, 0x0a },
++  { 0x038, 0x02 },
++  { 0x1d8, 0x43 },
++  { 0x124, 0x1f },
++  { 0x150, 0xff },
++  { 0x154, 0x0e },
++  { 0x1e0, 0x02 },
++};
++
++static const PongPhyReg kPhyTableV5SerdesG4[] = {
++  { 0x10c, 0x06 },
++};
++
++static const PongPhyReg kPhyTableV5TxG4[] = {
++  { 0x084, 0xe5 },
++};
++
++static const PongPhyReg kPhyTableV5RxG4[] = {
++  { 0x048, 0x81 },
++  { 0x080, 0x6f },
++  { 0x0ec, 0x00 },
++  { 0x0f0, 0x4a },
++  { 0x0f4, 0x0a },
++  { 0x100, 0x20 },
++  { 0x0f8, 0x80 },
++  { 0x0fc, 0x01 },
++  { 0x15c, 0xbf },
++  { 0x160, 0xbf },
++  { 0x164, 0x7f },
++  { 0x168, 0x7f },
++  { 0x16c, 0x2d },
++  { 0x170, 0x6d },
++  { 0x174, 0x6d },
++  { 0x178, 0xed },
++  { 0x180, 0x3c },
++};
++
++static const PongPhyReg kPhyTableV5PcsG4[] = {
++  { 0x060, 0x0a },
++};
+diff --git a/drivers/NativeUfs/PongUfsTransport.cpp b/drivers/NativeUfs/PongUfsTransport.cpp
+index cadba81..0e0d5e5 100644
+--- a/drivers/NativeUfs/PongUfsTransport.cpp
++++ b/drivers/NativeUfs/PongUfsTransport.cpp
+@@ -39,6 +39,7 @@ struct UfsHost {
+   OSSharedPtr<IOMemoryMap> hcMap, smmuMap;
+   uintptr_t hc = 0, smmu = 0, cb = 0;
+   IOBufferMemoryDescriptor *dma = nullptr;
++  bool deviceMapped = false;
+   uint8_t *virt = nullptr;
+   uint64_t phys = 0, blocks = 0;
+   IOLock *lock = nullptr;
+@@ -97,12 +98,14 @@ static IOReturn recordTransport(IOReturn result, uint32_t ocs) {
+   return result;
+ }
+ static void cacheCivac(const void *start, size_t size) {
++  if (gHost.deviceMapped) return;   // device memory: no cache maintenance
+   uintptr_t end = reinterpret_cast<uintptr_t>(start) + size;
+   for (uintptr_t at = reinterpret_cast<uintptr_t>(start) & ~uintptr_t(63); at < end; at += 64)
+     __asm__ volatile("dc civac, %0" :: "r"(at) : "memory");
+   __asm__ volatile("dsb sy" ::: "memory");
+ }
+ static void cacheInvalidate(const void *start, size_t size) {
++  if (gHost.deviceMapped) return;   // device memory: no cache maintenance
+   __asm__ volatile("dsb sy" ::: "memory");
+   uintptr_t end = reinterpret_cast<uintptr_t>(start) + size;
+   for (uintptr_t at = reinterpret_cast<uintptr_t>(start); at < end; at += 64)
+@@ -132,6 +135,7 @@ static bool transportFailure(const char *why) {
+   char text[2400];
+   formatUfsRootDiagnostics(text, sizeof(text), gRootDiagnostic, why, "PONG_UFS TRANSPORT");
+   IOLog("%s\nPONG_UFS: no media published; continue boot\n", text);
++  panic("PONG_UFS: transport failed (%s); diagnostics above", why);
+   PongProbeRecord(4, "ufs-transport", PongProbeFail, why, gRootDiagnostic.result);
+   snprintf(text, sizeof(text), "stage=%s op=%x ocs=%x scsi=%x protocol=%u", gRootDiagnostic.stage,
+            gRootDiagnostic.opcode, gRootDiagnostic.ocs, gRootDiagnostic.scsi, gRootDiagnostic.protocol);
+@@ -144,8 +148,9 @@ static bool transportFailure(const char *why) {
+ 
+ static bool hostBringUp() {
+   uint32_t requestWrites = 0;
+-  gHost.writable = PE_parse_boot_argn("pong_ufs_readwrite", &requestWrites, sizeof(requestWrites)) &&
+-      requestWrites == 1;
++  (void)PE_parse_boot_argn("pong_ufs_readwrite", &requestWrites, sizeof(requestWrites));
++  gHost.writable = false;  // V is a read-only link diagnostic, even with legacy args.
++  IOLog("PONG_UFS: V diagnostic forces storage writes OFF\n");
+   IOLog("PONG_UFS: storage write path %s by pong_ufs_readwrite boot-arg\n",
+         gHost.writable ? "enabled" : "disabled");
+   gRootDiagnostic.stage = "controller map";
+@@ -154,19 +159,36 @@ static bool hostBringUp() {
+   gRootDiagnostic.cap = read32(gHost.hc, 0);
+   gRootDiagnostic.version = read32(gHost.hc, 8);
+   recordTransport(kIOReturnNotReady, 15);
+-  gRootDiagnostic.stage = "DMA allocation";
+-  gHost.dma = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-    IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous) | IOOptionBits(kIOMemoryMapperNone), kDmaBytes, 4096);
++  // liuqin: SID e0 lives on a firmware translation bank, so a kernel allocation is
++  // not reachable for the controller (v122: NOP OUT submitted, never completed,
++  // SMMU readback showed the mapping unmoved). The loader's own request-list page
++  // is reachable - the firmware read the whole GPT through it - so adopt that page
++  // as device memory and keep the mapping for the lifetime of the driver.
++  gRootDiagnostic.stage = "firmware request list";
++  uint64_t firmwareList = (uint64_t(read32(gHost.hc, 0x54)) << 32) | read32(gHost.hc, 0x50);
++  if (!firmwareList || (firmwareList & 0xfff)) return transportFailure("firmware request list base");
++  static IOMemoryMap *gDeviceListMap = nullptr;
++  if (!gDeviceListMap) {
++    IODeviceMemory *memory = IODeviceMemory::withRange(firmwareList, kDmaBytes);
++    if (!memory) return transportFailure("firmware request list descriptor");
++    gDeviceListMap = memory->map(kIOMapAnywhere | kIOMapInhibitCache);
++    memory->release();
++  }
++  gHost.phys = firmwareList;
++  gHost.virt = gDeviceListMap ? reinterpret_cast<uint8_t *>(gDeviceListMap->getVirtualAddress()) : nullptr;
++  if (!gHost.virt) return transportFailure("firmware request list map");
++  gHost.deviceMapped = true;
+   gHost.lock = IOLockAlloc();
+-  if (!gHost.dma || !gHost.lock) return transportFailure("DMA allocation");
+-  gHost.virt = static_cast<uint8_t *>(gHost.dma->getBytesNoCopy());
+-  IOByteCount contiguous = 0;
+-  gHost.phys = gHost.dma->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
+-  gRootDiagnostic.dma = gHost.phys; gRootDiagnostic.contiguous = contiguous;
+-  if (!gHost.virt || !gHost.phys || (gHost.phys & 4095) || contiguous < kDmaBytes ||
+-      (!(gRootDiagnostic.cap & 0x01000000) && gHost.phys + kDmaBytes > 0x100000000ULL))
+-    return transportFailure("DMA address/contiguity");
+-  bzero(gHost.virt, kDmaBytes); cacheCivac(gHost.virt, kDmaBytes);
++  if (!gHost.lock) return transportFailure("request list lock");
++  gRootDiagnostic.dma = gHost.phys;
++  gRootDiagnostic.contiguous = kDmaBytes;
++  IOLog("PONG_UFS: using the firmware request list at %llx (%u bytes, device mapped)\n",
++        (unsigned long long)gHost.phys, kDmaBytes);
++  {
++    volatile uint32_t *words = reinterpret_cast<volatile uint32_t *>(gHost.virt);
++    for (uint32_t index = 0; index < kDmaBytes / 4; ++index) words[index] = 0;
++    __asm__ volatile("dsb sy" ::: "memory");
++  }
+   gRootDiagnostic.stage = "quiesce firmware queue";
+   const char *why = nullptr;
+   if (!hostStopQueue(&why)) return transportFailure(why);
+@@ -214,29 +236,21 @@ static bool hostBringUp() {
+   } // Release before queue commands or storage readiness notifications.
+   gRootDiagnostic.stage = "request list start";
+   if (!hostStartQueue(&why)) return transportFailure(why);
+-  // shim test_ufs probes with a COMMAND UPIU / TEST UNIT READY, never a NOP.
+-  // Align the first command with the one path proven to read the whole GPT.
+-  gRootDiagnostic.stage = "probe TUR (shim parity)";
+-  uint32_t probeScsi = 0xffff;
+-  bool probeOK = false;
+-  for (unsigned attempt = 0; attempt < 3 && !gHost.poisoned; ++attempt) {
+-    uint8_t probeTur[6] = {};
+-    if (hostScsi(0, probeTur, sizeof(probeTur), false, 0, 200000, &probeScsi) == kIOReturnSuccess) {
+-      probeOK = true;
+-      break;
+-    }
+-  }
+-  if (!probeOK) return transportFailure("probe TUR");
++  // liuqin: after a cold handover the device stack is parked, so ask its power mode
++  // and wake it before the link-level NOP, then wait for LUN 0.
+   uint32_t power = 0, scsi = 0;
+   gRootDiagnostic.stage = "power mode query";
+   if (hostQueryRead(3, 2, &power) != kIOReturnSuccess) return transportFailure("power mode query");
+   gRootDiagnostic.power = power;
++  IOLog("PONG_UFS: device bCurrentPowerMode=%02x\n", power & 0xff);
+   if ((power & 0xff) != 0x11) {
+     gRootDiagnostic.stage = "wake device";
+     uint8_t ssu[6] = {0x1b, 0, 0, 0, 0x10, 0};
+     if (hostScsi(0xd0, ssu, 6, false, 0, 500000, &scsi) != kIOReturnSuccess) return transportFailure("START STOP UNIT");
+     IOSleep(50);
+   }
++  gRootDiagnostic.stage = "NOP OUT";
++  if (hostNop() != kIOReturnSuccess) return transportFailure("NOP OUT");
+   gRootDiagnostic.stage = "LUN 0 ready";
+   for (unsigned attempt = 0; attempt < 20 && !gHost.poisoned; ++attempt) {
+     uint8_t tur[6] = {};
+@@ -489,6 +503,7 @@ bool PongUfsBlock::start(IOService *provider) {
+     // UFS controller. Do not invalidate already published OS/SystemOS disks.
+     IOLog("PONG_UFS: %s window has no supported filesystem header base=%llx bytes=%llx; media not published\n",
+           window.name, window.baseByte, window.size);
++    panic("PONG_UFS: %s window has no supported filesystem header", window.name);
+     char detail[96];
+     snprintf(detail, sizeof(detail), "%s filesystem header invalid", window.name);
+     PongProbeRecord(4, "ufs-transport", PongProbeFail, detail, window.baseByte);
+diff --git a/drivers/NativeUfs/RootCommands.h b/drivers/NativeUfs/RootCommands.h
+index 02a9012..6415aa0 100644
+--- a/drivers/NativeUfs/RootCommands.h
++++ b/drivers/NativeUfs/RootCommands.h
+@@ -54,9 +54,9 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
+   gRootDiagnostic.protocol = 0;
+   gRootDiagnostic.residual = 0;
+   gRootDiagnostic.sense = 0;
+-  uint8_t *utrd = gHost.virt;
++  volatile uint8_t *utrd = gHost.virt;
+   uint64_t ucdPhys = gHost.phys + kUcdOffset;
+-  uint32_t *words = reinterpret_cast<uint32_t *> (utrd);
++  volatile uint32_t *words = reinterpret_cast<volatile uint32_t *> (utrd);
+   for (unsigned index = 0; index < 8; index++) {
+     words[index] = 0;
+   }
+@@ -68,7 +68,7 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
+   words[7] = (dataBytes ? 1U : 0U) | ((kPrdtOffset >> 2) << 16);
+   if (dataBytes) {
+     uint64_t dataPhys = gHost.phys + kDataOffset;
+-    uint32_t *prd = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset);
++    volatile uint32_t *prd = reinterpret_cast<volatile uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset);
+     prd[0] = static_cast<uint32_t> (dataPhys);
+     prd[1] = static_cast<uint32_t> (dataPhys >> 32);
+     prd[2] = 0;
+@@ -79,14 +79,9 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
+   cacheCivac (gHost.virt, 64);
+   cacheCivac (gHost.virt + kUcdOffset, kPrdtOffset + 16);
+   if (dataBytes) cacheCivac (gHost.virt + kDataOffset, dataBytes);
+-  // Clear the transfer-done bit and the latched UIC error (IS bit2). A
+-  // handover leaves UE set; while it is latched the controller refuses to
+-  // consume the request doorbell, so every command times out with DB=1.
+-  // Clear every UIC error source before the IS summary bit: a latched
+-  // source reasserts IS.UE at once and the controller refuses the
+-  // doorbell. Write-one-to-clear, so write back exactly what was read.
++  // Sample UIC error codes, then acknowledge UTRCS and UE in IS (W1C).
+   for (unsigned offset = 0x38; offset <= 0x48; offset += 4)
+-    hostWrite (offset, read32 (gHost.hc, offset));
++    (void)read32 (gHost.hc, offset);
+   hostWrite (0x20, 1 | 4);
+   HardwareTransferPort port;
+   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+@@ -139,7 +134,7 @@ static bool hostIdle (void)
+ static bool hostClearUcd (void)
+ {
+   if (!hostIdle ()) return false;
+-  uint32_t *words = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset);
++  volatile uint32_t *words = reinterpret_cast<volatile uint32_t *> (gHost.virt + kUcdOffset);
+   for (unsigned index = 0; index < (kPrdtOffset + 16) / 4; index++) {
+     words[index] = 0;
+   }
+diff --git a/drivers/NativeUfs/RootTransportLayout.h b/drivers/NativeUfs/RootTransportLayout.h
+index f6c926e..3b4c0f1 100644
+--- a/drivers/NativeUfs/RootTransportLayout.h
++++ b/drivers/NativeUfs/RootTransportLayout.h
+@@ -4,6 +4,6 @@ enum : uint32_t {
+   kRspOffset = 512,
+   kPrdtOffset = 1024,
+   kDataOffset = 8192,
+-  kDataMax = 131072,
++  kDataMax = 8192,
+   kDmaBytes = kDataOffset + kDataMax,
+ };
