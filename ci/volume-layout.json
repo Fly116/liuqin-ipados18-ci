@@ -1,13 +1,13 @@
 {
   "ci_placeholder": false,
-  "note": "Volume UUIDs of the 22H374 userdata image this workstation holds (Fly116/liuqin-ipados18-ci run 44851228174); uppercase as IOMedia prints them.",
+  "note": "Volume UUIDs for the 22H374 images this run produced, uppercase as diskutil and IOMedia print them. Source: read from the APFS volume headers.",
   "os": {
     "uuid": "B07DF049-7AD9-47B5-9F8F-9EE728056398"
   },
   "systemos": {
-    "uuid": "5D08420A-43CD-43AD-8B1B-1E8F5B86AB0A"
+    "uuid": "0787A288-2922-4FD7-AE96-078108EDD261"
   },
   "data": {
-    "uuid": "5DF4DC0A-9451-4994-A495-1554A8AC42A2"
+    "uuid": "20B6F875-82B7-4E1A-A5DA-30732D060F65"
   }
 }
