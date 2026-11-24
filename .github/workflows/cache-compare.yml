@@ -47,8 +47,14 @@ jobs:
       - name: decrypt SystemOS
         run: |
           set -euo pipefail
-          ls -l work/22H374
-          IN=$(find work/22H374 -maxdepth 2 -iname "*SystemOS*" | head -1)
+          echo '== extracted tree =='
+          find work/22H374 -maxdepth 3 | head -40
+          IN=$(find work/22H374 -type f -name '*.dmg' | head -1)
+          if [ -z "$IN" ]; then
+            echo 'no .dmg found; dumping every file >1M:'
+            find work/22H374 -type f -size +1M | head -20
+            IN=$(find work/22H374 -type f -size +1M | head -1)
+          fi
           echo "input: $IN"
           venv/bin/python qprs/UniXNU-liuqin/scripts/decrypt-ipados18-aea.py \
             --input "$IN" --output work/systemos.dmg
