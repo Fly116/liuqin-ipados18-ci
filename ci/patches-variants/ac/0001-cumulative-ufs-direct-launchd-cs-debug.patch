@@ -918,15 +918,13 @@ index 2096c7f..1747f30 100644
 +zzzzzzzzzzzzzzzz-liuqin-cs-debug.patch
 diff --git a/patches/xnu-ipados18/zzzzzzzzzzzzzzzz-liuqin-cs-debug.patch b/patches/xnu-ipados18/zzzzzzzzzzzzzzzz-liuqin-cs-debug.patch
 new file mode 100644
-index 0000000..5fed7a8
+index 0000000..8642555
 --- /dev/null
 +++ b/patches/xnu-ipados18/zzzzzzzzzzzzzzzz-liuqin-cs-debug.patch
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,14 @@
 +--- a/bsd/kern/kern_descrip.c
 ++++ b/bsd/kern/kern_descrip.c
-+@@ -2735,7 +2735,12 @@
-+ 	kfree_type(struct nameidata, nd);
-+ 
++@@ -2737,6 +2737,11 @@
 + 	vnode_put(vp);
 + 
 + outdrop:
@@ -937,6 +935,7 @@ index 0000000..5fed7a8
 ++	}
 + 	return sys_fcntl_outdrop(p, fd, fp, vp, error);
 + }
++ 
 diff --git a/userland/init.c b/userland/init.c
 index d2bed55..05e2543 100644
 --- a/userland/init.c
