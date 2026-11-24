@@ -1,0 +1,134 @@
+name: cache-compare
+
+# One-shot diagnostic: is the dyld shared cache changed by the "copy original
+# files to an ordinary unsealed APFS volume" step (build-systemos18.py uses
+# ditto --nopreserveHFSCompression --nohfsCompression --noclone)?
+#
+# Steps: extract the decrypted original SystemOS from the 22H374 IPSW, copy the
+# dyld Caches directory with the exact ditto options, and byte-compare the main
+# cache file. The kernel on the tablet reports every block of that file valid
+# except block 32 (off=0x80000, the last code block), so the comparison is
+# narrowed to that file first; a full directory diff is printed as well.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  compare:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      IPSW_URL: https://updates.cdn-apple.com/2026WinterFCS/fullrestores/140-97955/A3F72236-89AD-47C5-8394-5E824079C175/iPad_10.2_18.7.10_22H374_Restore.ipsw
+    steps:
+      - name: checkout the QPRS device tree (scripts + userland)
+        uses: actions/checkout@v4
+        with:
+          repository: QPRS-6/iPadOS18-liuqin
+          ref: 38ca105d915283d6c5342063965ab13572288e8a
+          path: qprs
+          persist-credentials: false
+
+      - name: toolchain
+        run: |
+          set -euo pipefail
+          python3 -m venv venv
+          venv/bin/python -m pip install --disable-pip-version-check pyhpke
+          ls -l /usr/bin/aea
+
+      - name: download IPSW and extract Cryptex1,SystemOS
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          curl -L --retry 5 -o work/ipsw.zip "$IPSW_URL"
+          ls -l work/ipsw.zip
+          venv/bin/python qprs/UniXNU-liuqin/scripts/prepare-ipados18-components.py \
+            --ipsw work/ipsw.zip --output-dir work/22H374 --only "Cryptex1,SystemOS"
+
+      - name: decrypt SystemOS
+        run: |
+          set -euo pipefail
+          ls -l work/22H374
+          IN=$(find work/22H374 -maxdepth 2 -iname "*SystemOS*" | head -1)
+          echo "input: $IN"
+          venv/bin/python qprs/UniXNU-liuqin/scripts/decrypt-ipados18-aea.py \
+            --input "$IN" --output work/systemos.dmg
+          ls -l work/systemos.dmg
+
+      - name: extract the original main cache
+        run: |
+          set -euo pipefail
+          mkdir -p work/orig-mnt
+          hdiutil attach -readonly -noverify -nobrowse -owners on \
+            -mountpoint work/orig-mnt work/systemos.dmg
+          CACHE=work/orig-mnt/System/Library/Caches/com.apple.dyld
+          ls "$CACHE" | head -8
+          cp "$CACHE/dyld_shared_cache_arm64" work/original.bin
+          hdiutil detach work/orig-mnt
+          shasum -a 256 work/original.bin | tee work/original.sha
+          stat -f '%z bytes' work/original.bin
+
+      - name: copy the Caches directory with the exact ditto options
+        run: |
+          set -euo pipefail
+          hdiutil create -size 6400m -fs APFS -type SPARSE -volname PongTest work/copy.sparseimage
+          hdiutil attach -readwrite -noverify -nobrowse -owners on -mountpoint work/copy-mnt work/copy.sparseimage
+          # Same options build-systemos18.py passes for the first copy.
+          ditto --rsrc --extattr --acl --nopreserveHFSCompression --nohfsCompression --noclone \
+            work/orig-mnt/System/Library/Caches/com.apple.dyld work/copy-mnt/caches
+          cp work/copy-mnt/caches/dyld_shared_cache_arm64 work/copied.bin
+          hdiutil detach work/copy-mnt
+          shasum -a 256 work/copied.bin | tee work/copied.sha
+          stat -f '%z bytes' work/copied.bin
+
+      - name: byte compare
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, struct, collections
+          a = open('work/original.bin', 'rb').read()
+          b = open('work/copied.bin', 'rb').read()
+          print('sizes', len(a), len(b))
+          print('sha256 original', hashlib.sha256(a).hexdigest())
+          print('sha256 copied  ', hashlib.sha256(b).hexdigest())
+          if a == b:
+              print('IDENTICAL: ditto copy preserves the file byte for byte')
+          else:
+              n = min(len(a), len(b))
+              diffs = [i for i in range(n) if a[i] != b[i]]
+              print('differing bytes:', len(diffs))
+              if diffs:
+                  print('first diff at', hex(diffs[0]), 'last at', hex(diffs[-1]))
+                  # 16K block map
+                  bad = sorted({i // 16384 for i in diffs})
+                  print('16K blocks differing:', bad)
+                  for blk in bad[:6]:
+                      off = blk * 16384
+                      seg_a = a[off:off+16384]
+                      seg_b = b[off:off+16384]
+                      print(f'block {blk} off={off:#x}')
+                      print('  orig head', seg_a[:16].hex(), 'tail', seg_a[-32:].hex())
+                      print('  copy head', seg_b[:16].hex(), 'tail', seg_b[-32:].hex())
+          PY
+          # report every cache piece difference too (sizes and hashes)
+          python3 - <<'PY'
+          import hashlib, os
+          for root in ('work/orig-mnt/System/Library/Caches/com.apple.dyld',
+                       'work/copy-mnt/caches'):
+              print(root)
+              try:
+                  for name in sorted(os.listdir(root)):
+                      p = os.path.join(root, name)
+                      if os.path.isfile(p):
+                          print(' ', name, os.path.getsize(p))
+              except FileNotFoundError:
+                  print('  missing')
+          PY
+
+      - name: upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-compare-report
+          path: |
+            work/original.sha
+            work/copied.sha
+          retention-days: 3
