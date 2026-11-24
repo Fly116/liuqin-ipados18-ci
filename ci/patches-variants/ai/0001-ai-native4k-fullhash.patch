@@ -1003,10 +1003,10 @@ index 0000000..ed0ef6c
 + 	kfree_data(buffer, CS_NATIVE4K_CHUNK);
 diff --git a/patches/xnu-ipados18/zzzzzzzzzzzzzzzzzz-liuqin-native4k-fullhash.patch b/patches/xnu-ipados18/zzzzzzzzzzzzzzzzzz-liuqin-native4k-fullhash.patch
 new file mode 100644
-index 0000000..4719f98
+index 0000000..99c68ba
 --- /dev/null
 +++ b/patches/xnu-ipados18/zzzzzzzzzzzzzzzzzz-liuqin-native4k-fullhash.patch
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,103 @@
 +--- a/bsd/kern/ubc_subr.c
 ++++ b/bsd/kern/ubc_subr.c
 +@@ -5772,6 +5772,9 @@
@@ -1032,7 +1032,7 @@ index 0000000..4719f98
 + 		}
 + 		for (size_t block = 0; block < chunk_length; block += 16384) {
 + 			union cs_hash_union ctx;
-+@@ -5857,17 +5866,23 @@
++@@ -5857,17 +5866,52 @@
 + 			md->cs_final(digest, &ctx);
 + 			if (bcmp(expected, digest, md->cs_size)) {
 + 				os_atomic_inc(&cs_validate_page_bad_hash, relaxed);
@@ -1054,6 +1054,35 @@ index 0000000..4719f98
 ++				    digest[0], digest[1], digest[2], digest[3],
 ++				    data[0], data[1], data[2], data[3], data[4], data[5],
 ++				    data[6], data[7]);
+++				if (length >= 128) {
+++					printf("PONG native4K: tail0 %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+++					    data[length-128], data[length-127], data[length-126], data[length-125],
+++					    data[length-124], data[length-123], data[length-122], data[length-121],
+++					    data[length-120], data[length-119], data[length-118], data[length-117],
+++					    data[length-116], data[length-115], data[length-114], data[length-113],
+++					    data[length-112], data[length-111], data[length-110], data[length-109],
+++					    data[length-108], data[length-107], data[length-106], data[length-105],
+++					    data[length-104], data[length-103], data[length-102], data[length-101],
+++					    data[length-100], data[length-99], data[length-98], data[length-97]);
+++					printf("PONG native4K: tail1 %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+++					    data[length-96], data[length-95], data[length-94], data[length-93],
+++					    data[length-92], data[length-91], data[length-90], data[length-89],
+++					    data[length-88], data[length-87], data[length-86], data[length-85],
+++					    data[length-84], data[length-83], data[length-82], data[length-81],
+++					    data[length-80], data[length-79], data[length-78], data[length-77],
+++					    data[length-76], data[length-75], data[length-74], data[length-73],
+++					    data[length-72], data[length-71], data[length-70], data[length-69],
+++					    data[length-68], data[length-67], data[length-66], data[length-65]);
+++					printf("PONG native4K: tail2 %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+++					    data[length-64], data[length-63], data[length-62], data[length-61],
+++					    data[length-60], data[length-59], data[length-58], data[length-57],
+++					    data[length-56], data[length-55], data[length-54], data[length-53],
+++					    data[length-52], data[length-51], data[length-50], data[length-49],
+++					    data[length-48], data[length-47], data[length-46], data[length-45],
+++					    data[length-44], data[length-43], data[length-42], data[length-41],
+++					    data[length-40], data[length-39], data[length-38], data[length-37],
+++					    data[length-36], data[length-35], data[length-34], data[length-33]);
+++				}
 ++			} else {
 ++				os_atomic_inc(&cs_native4k_full_blocks, relaxed);
 ++				for (size_t sub = 0; sub < length; sub += PAGE_SIZE) {
@@ -1067,7 +1096,7 @@ index 0000000..4719f98
 + 			}
 + 		}
 + 		os_atomic_add(&cs_native4k_hash_ticks, mach_absolute_time() - hash_start, relaxed);
-+@@ -5881,7 +5896,13 @@
++@@ -5881,7 +5925,13 @@
 + 	blob->csb_native4k_hashes_size = allocation;
 + 	blob->csb_native4k_hash_count = count;
 + 	storage = 0;
