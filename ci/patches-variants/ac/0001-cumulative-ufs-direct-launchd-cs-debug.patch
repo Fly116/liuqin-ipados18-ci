@@ -918,13 +918,13 @@ index 2096c7f..1747f30 100644
 +zzzzzzzzzzzzzzzz-liuqin-cs-debug.patch
 diff --git a/patches/xnu-ipados18/zzzzzzzzzzzzzzzz-liuqin-cs-debug.patch b/patches/xnu-ipados18/zzzzzzzzzzzzzzzz-liuqin-cs-debug.patch
 new file mode 100644
-index 0000000..9288513
+index 0000000..5fed7a8
 --- /dev/null
 +++ b/patches/xnu-ipados18/zzzzzzzzzzzzzzzz-liuqin-cs-debug.patch
 @@ -0,0 +1,15 @@
 +--- a/bsd/kern/kern_descrip.c
 ++++ b/bsd/kern/kern_descrip.c
-+@@ -2735,6 +2735,11 @@
++@@ -2735,7 +2735,12 @@
 + 	kfree_type(struct nameidata, nd);
 + 
 + 	vnode_put(vp);
