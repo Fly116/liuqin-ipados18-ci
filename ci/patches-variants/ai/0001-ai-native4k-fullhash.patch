@@ -1003,10 +1003,10 @@ index 0000000..ed0ef6c
 + 	kfree_data(buffer, CS_NATIVE4K_CHUNK);
 diff --git a/patches/xnu-ipados18/zzzzzzzzzzzzzzzzzz-liuqin-native4k-fullhash.patch b/patches/xnu-ipados18/zzzzzzzzzzzzzzzzzz-liuqin-native4k-fullhash.patch
 new file mode 100644
-index 0000000..99c68ba
+index 0000000..73e45ba
 --- /dev/null
 +++ b/patches/xnu-ipados18/zzzzzzzzzzzzzzzzzz-liuqin-native4k-fullhash.patch
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,125 @@
 +--- a/bsd/kern/ubc_subr.c
 ++++ b/bsd/kern/ubc_subr.c
 +@@ -5772,6 +5772,9 @@
@@ -1032,7 +1032,7 @@ index 0000000..99c68ba
 + 		}
 + 		for (size_t block = 0; block < chunk_length; block += 16384) {
 + 			union cs_hash_union ctx;
-+@@ -5857,17 +5866,52 @@
++@@ -5857,17 +5866,74 @@
 + 			md->cs_final(digest, &ctx);
 + 			if (bcmp(expected, digest, md->cs_size)) {
 + 				os_atomic_inc(&cs_validate_page_bad_hash, relaxed);
@@ -1083,6 +1083,28 @@ index 0000000..99c68ba
 ++					    data[length-40], data[length-39], data[length-38], data[length-37],
 ++					    data[length-36], data[length-35], data[length-34], data[length-33]);
 ++				}
+++				if (length >= 16384) {
+++					/* Same offset, one small read: separates a broken large I/O from bad data on disk. */
+++					int resid2 = 0;
+++					uint8_t *tmp = kalloc_data((vm_size_t)length, Z_WAITOK);
+++					if (tmp != NULL) {
+++						uint8_t digest2[CS_HASH_MAX_SIZE];
+++						union cs_hash_union ctx2;
+++						int err2 = vn_rdwr(UIO_READ, vp, (caddr_t)tmp, (int)length,
+++						    blob->csb_base_offset + (off_t)offset,
+++						    UIO_SYSSPACE, 0, vfs_context_ucred(vfs_context_current()),
+++						    &resid2, current_proc());
+++						md->cs_init(&ctx2);
+++						md->cs_update(&ctx2, tmp, length);
+++						md->cs_final(digest2, &ctx2);
+++						printf("PONG native4K: reread off=%llu err=%d resid=%d exp=%02x%02x%02x%02x got=%02x%02x%02x%02x data=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+++						    (unsigned long long)offset, err2, resid2,
+++						    expected[0], expected[1], expected[2], expected[3],
+++						    digest2[0], digest2[1], digest2[2], digest2[3],
+++						    tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]);
+++						kfree_data(tmp, length);
+++					}
+++				}
 ++			} else {
 ++				os_atomic_inc(&cs_native4k_full_blocks, relaxed);
 ++				for (size_t sub = 0; sub < length; sub += PAGE_SIZE) {
@@ -1096,7 +1118,7 @@ index 0000000..99c68ba
 + 			}
 + 		}
 + 		os_atomic_add(&cs_native4k_hash_ticks, mach_absolute_time() - hash_start, relaxed);
-+@@ -5881,7 +5925,13 @@
++@@ -5881,7 +5947,13 @@
 + 	blob->csb_native4k_hashes_size = allocation;
 + 	blob->csb_native4k_hash_count = count;
 + 	storage = 0;
