@@ -76,6 +76,8 @@ jobs:
       - name: copy the Caches directory with the exact ditto options
         run: |
           set -euo pipefail
+          # The original was detached after the header read; re-attach it for ditto.
+          hdiutil attach -readonly -noverify -nobrowse -owners on -mountpoint work/orig-mnt work/systemos.dmg
           hdiutil create -size 6400m -fs APFS -type SPARSE -volname PongTest work/copy.sparseimage
           hdiutil attach -readwrite -noverify -nobrowse -owners on -mountpoint work/copy-mnt work/copy.sparseimage
           # Same options build-systemos18.py passes for the first copy.
@@ -83,12 +85,14 @@ jobs:
             work/orig-mnt/System/Library/Caches/com.apple.dyld work/copy-mnt/caches
           cp work/copy-mnt/caches/dyld_shared_cache_arm64 work/copied.bin
           hdiutil detach work/copy-mnt
+          hdiutil detach work/orig-mnt
           shasum -a 256 work/copied.bin | tee work/copied.sha
           stat -f '%z bytes' work/copied.bin
 
       - name: byte compare
         run: |
           set -euo pipefail
+          hdiutil attach -readonly -noverify -nobrowse -owners on -mountpoint work/orig-mnt work/systemos.dmg
           python3 - <<'PY'
           import hashlib, struct, collections
           a = open('work/original.bin', 'rb').read()
