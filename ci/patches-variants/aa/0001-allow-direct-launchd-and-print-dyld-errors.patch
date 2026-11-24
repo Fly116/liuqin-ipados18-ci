@@ -1,0 +1,20 @@
+--- a/patches/xnu-ipados18/0001-pong-darwin24.patch
++++ b/patches/xnu-ipados18/0001-pong-darwin24.patch
+@@ -2026,7 +2026,7 @@
+ +	uint32_t anonymous_owner = 99;
+ +#if !defined(XNU_OWNER_UNION_SYSTEMOS) || !XNU_OWNER_UNION_SYSTEMOS
+ +#if defined(XNU_OWNER_CRYPTEX_FILES) && XNU_OWNER_CRYPTEX_FILES
+-+	const char *fallback = "DYLD_FALLBACK_LIBRARY_PATH=/private/preboot/usr/lib";
+++	const char *fallback = "DYLD_PRINT_ERRORS=1";
+ +	user64_addr_t environment_vector[3] = {scratch + 0x400, scratch + 0x600, USER_ADDR_NULL};
+ +#else
+ +	user64_addr_t environment_vector[2] = {scratch + 0x400, USER_ADDR_NULL};
+@@ -2426,7 +2426,7 @@
+ +	 * Keep normal exec/signature/error handling. */
+ +	char pong_init_path[128];
+ +	if (PE_parse_boot_argn("pong_init_path", pong_init_path, sizeof(pong_init_path))) {
+-+		if (strcmp(pong_init_path, "/pong/init") != 0)
+++		if (strcmp(pong_init_path, "/pong/init") != 0 && strcmp(pong_init_path, "/sbin/launchd.ios") != 0)
+ +			panic("Unsupported Pong init path");
+ +		printf("Pong init: loading helper %s\n", pong_init_path);
+ +		error = load_init_program_at_path(p, (user_addr_t)scratch_addr, pong_init_path, init_envp);
