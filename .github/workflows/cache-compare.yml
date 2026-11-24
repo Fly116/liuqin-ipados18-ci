@@ -99,6 +99,14 @@ jobs:
           b = open('work/copied.bin', 'rb').read()
           print('sizes', len(a), len(b))
           print('sha256 original', hashlib.sha256(a).hexdigest())
+          # Reference dump of the block the kernel flags (off=0x80000, 16K at the code tail)
+          blk = 0x80000
+          seg = a[blk:blk + 16384]
+          print('ORIGINAL block32 head16', seg[:16].hex())
+          print('ORIGINAL block32 tail96', seg[16384-96:16384].hex())
+          tail96 = seg[16384-96:16384]
+          print('ORIGINAL block32 tail96 all_zero', all(x == 0 for x in tail96))
+          print('ORIGINAL block32 first 16k nonzero bytes', sum(1 for x in seg if x))
           print('sha256 copied  ', hashlib.sha256(b).hexdigest())
           if a == b:
               print('IDENTICAL: ditto copy preserves the file byte for byte')
